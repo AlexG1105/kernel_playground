@@ -35,7 +35,7 @@ from pallas_mosaic_gpu_mamba.chunk_state_fwd import chunk_state_fwd_mosaic
 _HAS_TRITON = False
 try:
     import torch
-    MAMBA_ROOT = os.path.expanduser("~/mamba")
+    MAMBA_ROOT = os.path.expanduser("/workspace/mamba")
     sys.path.insert(0, MAMBA_ROOT)
     pkg = types.ModuleType("mamba_ssm")
     pkg.__path__    = [os.path.join(MAMBA_ROOT, "mamba_ssm")]

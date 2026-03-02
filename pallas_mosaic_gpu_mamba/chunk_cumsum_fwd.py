@@ -60,19 +60,31 @@ No emit_pipeline is used.  The outer pallas_call stages each CTA's tile
 via TMA before the kernel body starts; TMA commits the outputs after the
 body returns.  Multiple CTAs overlap naturally via SM scheduling.
 
-SMEM usage per CTA (chunk_size=256, nheads_padded=128):
-  Input  staging (dt)    : 1 * 256 * 128 * 4 = 128 KB
-  Output staging (dt_out): 1 * 256 * 128 * 4 = 128 KB
-  Output staging (cs)    : 1 * 256 * 128 * 4 = 128 KB
-  Accumulator            : 128 * 4             ~   0 KB
-  Total                                        ~ 384 KB
+SMEM budget and automatic sub-chunking
+--------------------------------------
+For small chunk_sizes the three tiles (dt, dt_out, cs) fit in SMEM:
+  SMEM = 3 * chunk_size * nheads_padded * 4
+    chunk_size=64 , nheads_padded=128 → 96 KB  ✓
+    chunk_size=128, nheads_padded=128 → 192 KB ✓
 
-  NOTE: 384 KB exceeds the per-CTA SMEM limit on H100 (228 KB).
-  For chunk_size=256 reduce occupancy or use chunk_size <= 128:
-    chunk_size=128: 3 * 128 * 128 * 4 = 192 KB  ✓
-    chunk_size=64 : 3 *  64 * 128 * 4 =  96 KB  ✓
-  Typical Mamba2 chunk_size values are 64–256; choose based on nheads and
-  available SMEM.  The kernel does NOT validate SMEM limits at Python level.
+For large chunk_sizes (e.g. 256) the tiles exceed the H100 per-CTA limit
+(~228 KB).  The wrapper detects this and automatically switches to a
+**sub-chunked kernel** that uses a 2D grid:
+
+  Grid: (batch*nchunks, chunk_size // BQ)
+    dim 0 — parallel  (one CTA per batch×chunk)
+    dim 1 — sequential (iterate over sub-chunks of size BQ)
+
+  Mosaic GPU lowers sequential dimensions via emit_pipeline, so only
+  one sub-chunk tile set resides in SMEM at a time:
+    SMEM ≈ 3 * BQ * nheads_padded * 4  (+ scratch accumulator)
+
+  The prefix-sum accumulator is carried across sequential iterations
+  via a scratch_shapes buffer (persistent SMEM allocated outside the
+  pipeline loop).
+
+  BQ is chosen as the largest power-of-2 that divides chunk_size and
+  keeps SMEM within the hardware limit.
 
 Usage
 -----
@@ -96,7 +108,39 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 
 # ---------------------------------------------------------------------------
-# Kernel body
+# SMEM budget helpers
+# ---------------------------------------------------------------------------
+
+# H100 per-CTA SMEM limit reported by the Mosaic GPU runtime.
+_MAX_SMEM_BYTES = 232_448
+# Conservative margin for alignment padding and runtime metadata.
+_SMEM_OVERHEAD = 4096
+_EFFECTIVE_MAX_SMEM = _MAX_SMEM_BYTES - _SMEM_OVERHEAD
+
+
+def _tiles_smem(chunk_size: int, nheads_padded: int) -> int:
+    """SMEM bytes for the simple kernel (3 full tiles + accumulator)."""
+    return 3 * chunk_size * nheads_padded * 4 + nheads_padded * 4
+
+
+def _choose_BQ(chunk_size: int, nheads_padded: int) -> int:
+    """Largest power-of-2 sub-chunk that fits in SMEM and divides chunk_size.
+
+    SMEM per sub-chunk iteration (max_concurrent_steps=1):
+        3 * BQ * nheads_padded * 4   (input + 2 outputs)
+      + nheads_padded * 4            (scratch accumulator)
+    """
+    acc_bytes = nheads_padded * 4
+    row_bytes = 3 * nheads_padded * 4  # one row across all 3 tiles
+    max_rows = (_EFFECTIVE_MAX_SMEM - acc_bytes) // row_bytes
+    BQ = 1
+    while BQ * 2 <= min(max_rows, chunk_size) and chunk_size % (BQ * 2) == 0:
+        BQ *= 2
+    return BQ
+
+
+# ---------------------------------------------------------------------------
+# Kernel body — simple path (full tile fits in SMEM)
 # ---------------------------------------------------------------------------
 
 def _chunk_cumsum_mosaic_kernel(
@@ -134,7 +178,7 @@ def _chunk_cumsum_mosaic_kernel(
             # Optional softplus: log1p(exp(x)).  Guard for overflow (x > 20).
             if dt_softplus:
                 safe = jnp.where(dt_i <= 20.0, dt_i, jnp.zeros_like(dt_i))
-                dt_i = jnp.where(dt_i <= 20.0, jnp.log1p(jnp.exp(safe)), dt_i)
+                dt_i = jnp.where(dt_i <= 20.0, jnp.log(1+jnp.exp(safe)), dt_i)
 
             # Clamp to [dt_min, dt_max].
             dt_i = jnp.clip(dt_i, dt_min, dt_max)
@@ -151,6 +195,55 @@ def _chunk_cumsum_mosaic_kernel(
     pl.run_scoped(
         _scan,
         plgpu.SMEM((nheads_padded,), jnp.float32),  # accumulator: 128+ elements ✓
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kernel body — sub-chunk path (for large chunk_size)
+# ---------------------------------------------------------------------------
+
+def _chunk_cumsum_sub_kernel(
+    dt_ref,        # SMEM ref: (1, BQ, nheads_padded) — input sub-chunk
+    acc_in_ref,    # SMEM ref: (1, nheads_padded)     — input accumulator
+    dt_out_ref,    # SMEM ref: (1, BQ, nheads_padded) — output dt_out
+    cs_ref,        # SMEM ref: (1, BQ, nheads_padded) — output cumsum
+    acc_out_ref,   # SMEM ref: (1, nheads_padded)     — output accumulator
+    *,
+    dt_softplus: bool,
+    dt_min: float,
+    dt_max: float,
+    BQ: int,
+    nheads_padded: int,
+):
+    """
+    Processes one sub-chunk of BQ timesteps with an explicit accumulator.
+
+    Called via jax.lax.scan over sub-chunks.  The accumulator is passed
+    in/out through GMEM (acc_in_ref / acc_out_ref) to avoid the Mosaic GPU
+    sequential-grid output-TMA bug that silently drops writes for tiles
+    larger than a single element.
+    """
+    def _scan(acc_smem):
+        acc_smem[:] = acc_in_ref[0, :]
+
+        @pl.loop(0, BQ)
+        def _step(i):
+            dt_i = dt_ref[0, i, :].astype(jnp.float32)
+
+            if dt_softplus:
+                safe = jnp.where(dt_i <= 20.0, dt_i, jnp.zeros_like(dt_i))
+                dt_i = jnp.where(dt_i <= 20.0, jnp.log(1 + jnp.exp(safe)), dt_i)
+
+            dt_i = jnp.clip(dt_i, dt_min, dt_max)
+            dt_out_ref[0, i, :] = dt_i
+            acc_smem[:] = acc_smem[:] + dt_i
+            cs_ref[0, i, :] = acc_smem[:]
+
+        acc_out_ref[0, :] = acc_smem[:]
+
+    pl.run_scoped(
+        _scan,
+        plgpu.SMEM((nheads_padded,), jnp.float32),
     )
 
 
@@ -233,43 +326,111 @@ def chunk_cumsum_fwd_mosaic(
     # ------------------------------------------------------------------
     # Step 5: Launch the Pallas Mosaic GPU kernel.
     #
-    #   Grid: (n_chunks_total,) — one independent CTA per (batch, chunk).
-    #
-    #   BlockSpec: each CTA sees (1, chunk_size, nheads_padded) of dt_flat.
-    #   The kernel writes (1, chunk_size, nheads_padded) tiles of dt_out
-    #   and cs (cumsum of dt_out, without A).
+    #   Two paths depending on whether full tiles fit in SMEM:
+    #   a) Simple:    1D grid, full (1, chunk_size, nheads_padded) tiles.
+    #   b) Pipelined: 2D grid with sequential sub-chunking along
+    #                 chunk_size, tiles of (1, BQ, nheads_padded).
     # ------------------------------------------------------------------
-    kernel = partial(
-        _chunk_cumsum_mosaic_kernel,
-        dt_softplus=dt_softplus,
-        dt_min=dt_min,
-        dt_max=dt_max,
-        chunk_size=chunk_size,
-        nheads_padded=nheads_padded,
-    )
-
-    tile_spec = pl.BlockSpec(
-        (1, chunk_size, nheads_padded),
-        lambda bc: (bc, 0, 0),
-    )
-
-    dt_out_flat, cs_flat = pl.pallas_call(
-        kernel,
-        out_shape=[
-            jax.ShapeDtypeStruct(
-                (n_chunks_total, chunk_size, nheads_padded), jnp.float32
-            ),
-            jax.ShapeDtypeStruct(
-                (n_chunks_total, chunk_size, nheads_padded), jnp.float32
-            ),
-        ],
-        grid=(n_chunks_total,),
-        in_specs=[tile_spec],
-        out_specs=[tile_spec, tile_spec],
-        compiler_params=plgpu.CompilerParams(
-            dimension_semantics=["parallel"],
+    out_shapes = [
+        jax.ShapeDtypeStruct(
+            (n_chunks_total, chunk_size, nheads_padded), jnp.float32
         ),
-    )(dt_flat)
+        jax.ShapeDtypeStruct(
+            (n_chunks_total, chunk_size, nheads_padded), jnp.float32
+        ),
+    ]
+
+    if _tiles_smem(chunk_size, nheads_padded) <= _EFFECTIVE_MAX_SMEM:
+        # --- simple path: full tile fits in SMEM ---
+        kernel = partial(
+            _chunk_cumsum_mosaic_kernel,
+            dt_softplus=dt_softplus,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            chunk_size=chunk_size,
+            nheads_padded=nheads_padded,
+        )
+        tile_spec = pl.BlockSpec(
+            (1, chunk_size, nheads_padded),
+            lambda bc: (bc, 0, 0),
+        )
+        dt_out_flat, cs_flat = pl.pallas_call(
+            kernel,
+            out_shape=out_shapes,
+            grid=(n_chunks_total,),
+            in_specs=[tile_spec],
+            out_specs=[tile_spec, tile_spec],
+            compiler_params=plgpu.CompilerParams(
+                dimension_semantics=["parallel"],
+            ),
+        )(dt_flat)
+    else:
+        # --- sub-chunk path: lax.scan over sub-chunks ---
+        #
+        # The Mosaic GPU sequential-grid output TMA has a known issue
+        # with multi-element tiles, so we instead iterate over sub-chunks
+        # via jax.lax.scan, each processed by a 1D-parallel Pallas kernel
+        # that takes the accumulator as an explicit input/output.
+        BQ = _choose_BQ(chunk_size, nheads_padded)
+        num_sub = chunk_size // BQ
+
+        kernel = partial(
+            _chunk_cumsum_sub_kernel,
+            dt_softplus=dt_softplus,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            BQ=BQ,
+            nheads_padded=nheads_padded,
+        )
+
+        dt_tile = pl.BlockSpec((1, BQ, nheads_padded), lambda bc: (bc, 0, 0))
+        acc_tile = pl.BlockSpec((1, nheads_padded), lambda bc: (bc, 0))
+
+        # Reshape dt to (num_sub, n_chunks_total, BQ, nheads_padded)
+        # so lax.scan iterates over sub-chunks.
+        dt_subs = dt_flat.reshape(
+            n_chunks_total, num_sub, BQ, nheads_padded
+        ).transpose(1, 0, 2, 3)
+
+        def _scan_body(carry, dt_sub):
+            # carry: (n_chunks_total, nheads_padded)
+            # dt_sub: (n_chunks_total, BQ, nheads_padded)
+            dt_out_sub, cs_sub, acc_out = pl.pallas_call(
+                kernel,
+                out_shape=[
+                    jax.ShapeDtypeStruct(
+                        (n_chunks_total, BQ, nheads_padded), jnp.float32
+                    ),
+                    jax.ShapeDtypeStruct(
+                        (n_chunks_total, BQ, nheads_padded), jnp.float32
+                    ),
+                    jax.ShapeDtypeStruct(
+                        (n_chunks_total, nheads_padded), jnp.float32
+                    ),
+                ],
+                grid=(n_chunks_total,),
+                in_specs=[dt_tile, acc_tile],
+                out_specs=[dt_tile, dt_tile, acc_tile],
+                compiler_params=plgpu.CompilerParams(
+                    dimension_semantics=["parallel"],
+                ),
+            )(dt_sub, carry)
+
+            return acc_out, (dt_out_sub, cs_sub)
+
+        init_carry = jnp.zeros((n_chunks_total, nheads_padded), jnp.float32)
+        _, (dt_out_subs, cs_subs) = jax.lax.scan(
+            _scan_body, init_carry, dt_subs,
+        )
+
+        # dt_out_subs: (num_sub, n_chunks_total, BQ, nheads_padded)
+        # → (n_chunks_total, chunk_size, nheads_padded)
+        dt_out_flat = dt_out_subs.transpose(1, 0, 2, 3).reshape(
+            n_chunks_total, chunk_size, nheads_padded
+        )
+        cs_flat = cs_subs.transpose(1, 0, 2, 3).reshape(
+            n_chunks_total, chunk_size, nheads_padded
+        )
 
     # ------------------------------------------------------------------
     # Step 6: Reshape and transpose outputs to (batch, nheads, nchunks, chunk_size).

@@ -22,61 +22,54 @@ where for each (batch b, chunk c, head h, group g = h // ratio):
 
 Grid and tile design
 --------------------
-Outer pallas_call grid: (BCH, PM, PN)
+pl.kernel with Mesh grid: (BCH, PM, PN)
   BCH = batch * nchunks * nheads   — one CTA per (batch, chunk, head)
   PM  = headdim_padded // BM       — tiles over headdim
   PN  = dstate_padded  // BN       — tiles over dstate
 
   All three dimensions are "parallel" (independent CTAs).
+  pl.kernel / core_map gives the kernel body GMEM refs.
 
-Tile per CTA: (1, BM, chunk_size) for x_T, (1, chunk_size, BN) for B
+Tile per CTA: (BM, chunk_size) for x_T, (chunk_size, BN) for B_scaled
   BM = BN = BK = 64 (defaults; typical for H100 WGMMA)
 
-Mosaic GPU WGMMA + emit_pipeline
+Mosaic GPU emit_pipeline + WGMMA
 ---------------------------------
-Inside each CTA, emit_pipeline runs K = chunk_size // BK pipeline steps:
+emit_pipeline receives GMEM refs and manages TMA double-buffered loading
+into swizzled SMEM.  The pipeline body passes swizzled SMEM refs directly
+to WGMMA — no intermediate register copies needed.
 
-  step k:
-    x_T_tile : (BM, BK) f32   from x_T_ref.at[0] at column k
-    B_tile   : (BK, BN) f32   from B_ref.at[0] at row k
-    scale_k  : (BK,)   f32   from scale_ref.at[0] at position k
+  step k (K = chunk_size // BK):
+    TMA loads (BM, BK) bf16 of x_T into swizzled SMEM → a_smem
+    TMA loads (BK, BN) bf16 of B   into swizzled SMEM → b_smem
+    wgmma(acc, a_smem, b_smem)  — accumulates in f32 ACC registers
 
-    B_scaled = (B_tile * scale_k[:, None]).astype(bf16)   — in registers
-    x_T_bf16 = x_T_tile.astype(bf16)                      — in registers
+  After all K steps:
+    states_ref[bch, pm*BM:(pm+1)*BM, pn*BN:(pn+1)*BN] = acc[...]
 
-    pl.run_scoped(do_wgmma, ACC(BM,BN,f32), SMEM(BM,BK,bf16,A_transforms),
-                            SMEM(BK,BN,bf16,B_transforms))
-      a_scratch[...] = x_T_bf16   → commit_smem() → wgmma → wgmma_wait(0)
-      b_scratch[...] = B_scaled
+Note: we CANNOT use pallas_call with BlockSpec here because pallas_call
+stages tiles into SMEM before the kernel runs, but emit_pipeline needs
+GMEM refs (it does its own TMA).  Writing from registers to
+WGMMA-transformed SMEM is not supported (WGStridedFragLayout error).
 
-    carry += tile_result
+Scale and group mapping precomputed in wrapper
+----------------------------------------------
+  scale = exp(min(dA_cs_last - dA_cumsum, 0)) * dt
+  B_scaled = B_expanded[head→group] * scale[:, :, None]
 
-  states_ref[0,:,:] = carry
+  This is done in JAX/XLA before the kernel, so the kernel only sees
+  B_scaled indexed by BCH (no group mapping, no scale input).
 
-Scale precomputed in wrapper
-----------------------------
-  dA_cs_last = dA_cumsum[:,:,:,-1:]   # (batch,nheads,nchunks,1)
-  scale = exp(min(dA_cs_last - dA_cumsum, 0)) * dt   # (batch,nheads,nchunks,chunk_size)
-
-  Then flattened to (BCH, chunk_size) for the kernel.
-
-ngroups mapping
----------------
-  B is indexed by BCG = batch * nchunks * ngroups.
-  Given bch = batch_idx*(nchunks*nheads) + chunk_idx*nheads + head_idx:
-    chunk_batch = bch // nheads        (batch_idx*nchunks + chunk_idx)
-    group_idx   = (bch % nheads) // ratio
-    bcg         = chunk_batch * ngroups + group_idx
+  Both x_T and B_scaled are cast to bf16 in the wrapper since H100
+  WGMMA requires bf16 (or f16/tf32/fp8) operands.  The WGMMA
+  accumulator is f32, preserving precision in the reduction.
 
 SMEM budget (BM=BN=BK=64, num_stages=2)
 -----------------------------------------
-  x_T staging  : 2 * 64*64*4 =  32 KB
-  B   staging  : 2 * 64*64*4 =  32 KB
-  scale staging: 2 * 64*4    ~   0.5 KB
-  A scratch    : 64*64*2     =   8 KB  (bf16)
-  B scratch    : 64*64*2     =   8 KB  (bf16)
-  ACC (regs)   : 64*64*4     =  16 KB  (not SMEM)
-  Total SMEM   :             ~ 80.5 KB  ✓  (H100 limit: 228 KB)
+  x_T staging  : 2 * 64*64*2  =  16 KB  (bf16, double-buffered)
+  B   staging  : 2 * 64*64*2  =  16 KB  (bf16, double-buffered)
+  ACC (regs)   : 64*64*4      =  16 KB  (f32, not SMEM)
+  Total SMEM   :              ~  32 KB  ✓  (H100 limit: 228 KB)
 
 Usage
 -----
@@ -92,19 +85,19 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import jax.lax as lax
 import jax.experimental.pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 
 # ---------------------------------------------------------------------------
-# Kernel body
+# Kernel body (receives GMEM refs from pl.kernel / core_map)
 # ---------------------------------------------------------------------------
 
-def _chunk_state_mosaic_kernel(
-    x_t_ref,    # GMEM ref: (1, BM, chunk_size) f32  — A-matrix (x transposed)
-    B_ref,      # GMEM ref: (1, chunk_size, BN) f32  — B-matrix (to be scaled)
-    scale_ref,  # GMEM ref: (1, chunk_size)    f32  — precomputed scale
-    states_ref, # GMEM ref: (1, BM, BN)        f32  — output
+def _chunk_state_kernel_body(
+    x_t_ref,    # GMEM ref: (BCH, headdim_padded, chunk_size) bf16
+    B_ref,      # GMEM ref: (BCH, chunk_size, dstate_padded) bf16  (pre-scaled)
+    states_ref, # GMEM ref: (BCH, headdim_padded, dstate_padded) f32
     *,
     BM: int,
     BK: int,
@@ -113,80 +106,64 @@ def _chunk_state_mosaic_kernel(
     num_stages: int,
 ):
     """
-    One CTA handles one (batch, chunk, head, BM-tile, BN-tile) output block.
+    One CTA computes one (BM, BN) output tile for a given (bch, pm, pn).
 
-    emit_pipeline runs K = chunk_size // BK steps.  Each step:
-      - TMA-loads (BM, BK) of x_T and (BK, BN) of B into SMEM
-      - Scales B by scale in registers
-      - Writes both to bf16 SMEM scratch with WGMMA-compatible layout
-      - Issues WGMMA and accumulates into a register ACC
-
-    The final ACC is written back to states_ref.
+    Uses emit_pipeline for double-buffered TMA loading of bf16 tiles
+    into WGMMA-compatible swizzled SMEM.  The pipeline body passes
+    swizzled SMEM refs directly to wgmma (no intermediate register copy).
     """
+    bch = lax.axis_index("bch")
+    pm  = lax.axis_index("pm")
+    pn  = lax.axis_index("pn")
+
     K = chunk_size // BK
 
-    # Swizzle/tiling transforms for WGMMA A-matrix scratch (BM, BK) bf16
-    a_swizzle = plgpu.find_swizzle(BK * 16)          # 16 bits per bf16 element
+    # GMEM sub-refs for this CTA's portion of the arrays
+    x_t_gmem = x_t_ref.at[bch, pl.ds(pm * BM, BM), :]     # (BM, chunk_size) bf16
+    B_gmem   = B_ref.at[bch, :, pl.ds(pn * BN, BN)]        # (chunk_size, BN) bf16
+
+    # Swizzle/tiling transforms for WGMMA-compatible SMEM layout
+    a_swizzle = plgpu.find_swizzle(BK * 16)                 # 16 bits per bf16
     a_transforms = (
         plgpu.TilingTransform((8, a_swizzle // 2)),
         plgpu.SwizzleTransform(a_swizzle),
     )
-
-    # Swizzle/tiling transforms for WGMMA B-matrix scratch (BK, BN) bf16
     b_swizzle = plgpu.find_swizzle(BN * 16)
     b_transforms = (
         plgpu.TilingTransform((8, b_swizzle // 2)),
         plgpu.SwizzleTransform(b_swizzle),
     )
 
-    def pipeline_body(step_indices, x_t_smem, B_smem, scale_smem, carry):
-        # x_t_smem : SMEM (BM, BK) f32  — A-matrix tile (raw, no transforms)
-        # B_smem   : SMEM (BK, BN) f32  — B-matrix tile (raw, no transforms)
-        # scale_smem: SMEM (BK,)  f32  — scale slice
-
-        # Load from SMEM into registers, cast for WGMMA
-        x_t_tile = x_t_smem[...].astype(jnp.bfloat16)          # (BM, BK) bf16
-        B_tile   = B_smem[...]                                   # (BK, BN) f32
-        scale_k  = scale_smem[...]                               # (BK,)    f32
-
-        # Scale B in registers, cast to bf16 for WGMMA
-        B_scaled = (B_tile * scale_k[:, None]).astype(jnp.bfloat16)  # (BK, BN) bf16
-
-        def do_wgmma(acc_ref, a_scratch_ref, b_scratch_ref):
-            # Write A and B to SMEM scratch with WGMMA-compatible layout
-            a_scratch_ref[...] = x_t_tile   # (BM, BK) bf16 → A scratch
-            b_scratch_ref[...] = B_scaled   # (BK, BN) bf16 → B scratch
-            plgpu.commit_smem()
-            plgpu.wgmma(acc_ref, a_scratch_ref, b_scratch_ref)
+    def _with_acc(acc_ref):
+        # Pipeline body: TMA loads into swizzled SMEM, then WGMMA accumulates.
+        # acc_ref is captured from closure (allocated outside the pipeline).
+        def pipeline_body(step, a_smem, b_smem, carry):
+            plgpu.wgmma(acc_ref, a_smem, b_smem)
             plgpu.wgmma_wait(0)
-            return acc_ref[...]
+            return ()
 
-        tile_result = pl.run_scoped(
-            do_wgmma,
-            plgpu.ACC((BM, BN), jnp.float32),
-            plgpu.SMEM((BM, BK), jnp.bfloat16, transforms=a_transforms),
-            plgpu.SMEM((BK, BN), jnp.bfloat16, transforms=b_transforms),
+        plgpu.emit_pipeline(
+            pipeline_body,
+            grid=(K,),
+            in_specs=[
+                plgpu.BlockSpec(
+                    (BM, BK), lambda k: (0, k),
+                    transforms=a_transforms,
+                ),
+                plgpu.BlockSpec(
+                    (BK, BN), lambda k: (k, 0),
+                    transforms=b_transforms,
+                ),
+            ],
+            max_concurrent_steps=num_stages,
+        )(x_t_gmem, B_gmem)
+
+        # Write accumulated f32 result to output GMEM
+        states_ref[bch, pl.ds(pm * BM, BM), pl.ds(pn * BN, BN)] = (
+            acc_ref[...].astype(jnp.float32)
         )
-        return carry + tile_result
 
-    # Emit double-buffered TMA pipeline over K reduction steps
-    acc = plgpu.emit_pipeline(
-        pipeline_body,
-        grid=(K,),
-        in_specs=[
-            # x_T: (BM, chunk_size) GMEM → load (BM, BK) tile at column k
-            plgpu.BlockSpec((BM, BK), lambda k: (0, k)),
-            # B:   (chunk_size, BN) GMEM → load (BK, BN) tile at row k
-            plgpu.BlockSpec((BK, BN), lambda k: (k, 0)),
-            # scale: (chunk_size,) GMEM → load (BK,) slice at position k
-            plgpu.BlockSpec((BK,), lambda k: (k,)),
-        ],
-        max_concurrent_steps=num_stages,
-        init_carry=jnp.zeros((BM, BN), jnp.float32),
-    )(x_t_ref.at[0], B_ref.at[0], scale_ref.at[0])
-
-    # Write accumulated result to output
-    states_ref[0, :, :] = acc
+    pl.run_scoped(_with_acc, plgpu.ACC((BM, BN), jnp.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -253,13 +230,14 @@ def chunk_state_fwd_mosaic(
     scale = jnp.exp(jnp.minimum(dA_cs_last - dA_cumsum, 0.0)) * dt
 
     # ------------------------------------------------------------------
-    # Step 3: Reshape x → (BCH, headdim_padded, chunk_size).
+    # Step 3: Reshape x → (BCH, headdim_padded, chunk_size) bf16.
     #
     #   x: (batch, seqlen, nheads, headdim)
     #   → (batch, nchunks, chunk_size, nheads, headdim)
     #   → (batch, nchunks, nheads, headdim, chunk_size)   [transpose]
     #   → (BCH, headdim, chunk_size)                      [reshape]
     #   → (BCH, headdim_padded, chunk_size)               [pad]
+    #   → bf16
     # ------------------------------------------------------------------
     x = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
     x_t = x.transpose(0, 1, 3, 4, 2)           # (batch, nchunks, nheads, headdim, chunk_size)
@@ -270,14 +248,19 @@ def chunk_state_fwd_mosaic(
     if headdim_padded > headdim:
         x_flat = jnp.pad(x_flat, ((0, 0), (0, headdim_padded - headdim), (0, 0)))
 
+    x_flat = x_flat.astype(jnp.bfloat16)       # WGMMA requires bf16
+
     # ------------------------------------------------------------------
-    # Step 4: Reshape B → (BCG, chunk_size, dstate_padded).
+    # Step 4: Pre-scale B and reshape to (BCH, chunk_size, dstate_padded) bf16.
     #
     #   B: (batch, seqlen, ngroups, dstate)
-    #   → (batch, nchunks, chunk_size, ngroups, dstate)
-    #   → (batch, nchunks, ngroups, chunk_size, dstate)   [transpose]
-    #   → (BCG, chunk_size, dstate)                       [reshape]
-    #   → (BCG, chunk_size, dstate_padded)                [pad]
+    #   → (batch, nchunks, ngroups, chunk_size, dstate)
+    #   scale: (batch, nheads, nchunks, chunk_size)
+    #
+    #   We expand B from (BCG,) to (BCH,) by repeating each group's B
+    #   across its heads, then multiply by scale.  This avoids passing
+    #   scale as a separate kernel input and eliminates the group index
+    #   mapping inside the kernel.
     # ------------------------------------------------------------------
     B = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
     B = B.transpose(0, 1, 3, 2, 4)             # (batch, nchunks, ngroups, chunk_size, dstate)
@@ -288,72 +271,57 @@ def chunk_state_fwd_mosaic(
     if dstate_padded > dstate:
         B_flat = jnp.pad(B_flat, ((0, 0), (0, 0), (0, dstate_padded - dstate)))
 
-    # ------------------------------------------------------------------
-    # Step 5: Flatten scale → (BCH, chunk_size).
-    #
-    #   scale: (batch, nheads, nchunks, chunk_size)
-    #   → (batch, nchunks, nheads, chunk_size)   [transpose]
-    #   → (BCH, chunk_size)                      [reshape]
-    # ------------------------------------------------------------------
-    scale_t = scale.transpose(0, 2, 1, 3)       # (batch, nchunks, nheads, chunk_size)
+    # Map each bch index to its corresponding bcg index for group expansion.
+    #   bch = batch_idx*(nchunks*nheads) + chunk_idx*nheads + head_idx
+    #   bcg = (batch_idx*nchunks + chunk_idx)*ngroups + head_idx // ratio
+    bch_indices = jnp.arange(BCH)
+    chunk_batch = bch_indices // nheads          # batch_idx*nchunks + chunk_idx
+    head_idx = bch_indices % nheads
+    group_idx = head_idx // ratio
+    bcg_indices = chunk_batch * ngroups + group_idx
+
+    B_expanded = B_flat[bcg_indices]             # (BCH, chunk_size, dstate_padded)
+
+    # Flatten scale: (batch, nheads, nchunks, chunk_size)
+    #   → (batch, nchunks, nheads, chunk_size) → (BCH, chunk_size)
+    scale_t = scale.transpose(0, 2, 1, 3)
     scale_flat = scale_t.reshape(BCH, chunk_size)
 
+    # Pre-multiply: B_scaled[bch, t, :] = B[bcg, t, :] * scale[bch, t]
+    B_scaled = (B_expanded * scale_flat[:, :, None]).astype(jnp.bfloat16)
+
     # ------------------------------------------------------------------
-    # Step 6: Launch Pallas Mosaic GPU kernel.
+    # Step 5: Launch Pallas Mosaic GPU kernel.
     #
-    #   Grid: (BCH, PM, PN) — all parallel.
-    #   Each CTA computes states[bch, pm*BM:(pm+1)*BM, pn*BN:(pn+1)*BN].
-    #
-    #   B-matrix group mapping:
-    #     bch       = batch_idx*(nchunks*nheads) + chunk_idx*nheads + head_idx
-    #     head_idx  = bch % nheads
-    #     chunk_batch = bch // nheads   (= batch_idx*nchunks + chunk_idx)
-    #     group_idx = head_idx // ratio
-    #     bcg       = chunk_batch * ngroups + group_idx
+    #   pl.kernel uses core_map to dispatch over a Mesh.  The kernel
+    #   body gets GMEM refs (not SMEM), which emit_pipeline can TMA-load
+    #   into swizzled SMEM for WGMMA.
     # ------------------------------------------------------------------
     PM = headdim_padded // BM
     PN = dstate_padded  // BN
 
-    kernel = partial(
-        _chunk_state_mosaic_kernel,
-        BM=BM, BK=BK, BN=BN,
-        chunk_size=chunk_size,
-        num_stages=num_stages,
+    mesh = plgpu.Mesh(
+        grid=(BCH, PM, PN),
+        grid_names=("bch", "pm", "pn"),
     )
 
-    def b_index_map(bch, pm, pn):
-        head_idx    = bch % nheads
-        chunk_batch = bch // nheads            # batch_idx*nchunks + chunk_idx
-        group_idx   = head_idx // ratio        # ratio is a Python constant
-        bcg         = chunk_batch * ngroups + group_idx
-        return (bcg, 0, pn)
-
-    states_flat, = pl.pallas_call(
-        kernel,
-        out_shape=[
-            jax.ShapeDtypeStruct(
-                (BCH, headdim_padded, dstate_padded), jnp.float32
-            )
-        ],
-        grid=(BCH, PM, PN),
-        in_specs=[
-            # x_T: each CTA sees (1, BM, chunk_size) tile
-            pl.BlockSpec((1, BM, chunk_size), lambda bch, pm, pn: (bch, pm, 0)),
-            # B:   each CTA sees (1, chunk_size, BN) tile from group bcg
-            pl.BlockSpec((1, chunk_size, BN), b_index_map),
-            # scale: each CTA sees (1, chunk_size) slice
-            pl.BlockSpec((1, chunk_size), lambda bch, pm, pn: (bch, 0)),
-        ],
-        out_specs=[
-            pl.BlockSpec((1, BM, BN), lambda bch, pm, pn: (bch, pm, pn)),
-        ],
-        compiler_params=plgpu.CompilerParams(
-            dimension_semantics=["parallel", "parallel", "parallel"],
+    kernel_fn = pl.kernel(
+        partial(
+            _chunk_state_kernel_body,
+            BM=BM, BK=BK, BN=BN,
+            chunk_size=chunk_size,
+            num_stages=num_stages,
         ),
-    )(x_flat, B_flat, scale_flat)
+        out_shape=jax.ShapeDtypeStruct(
+            (BCH, headdim_padded, dstate_padded), jnp.float32
+        ),
+        mesh=mesh,
+    )
+
+    states_flat = kernel_fn(x_flat, B_scaled)
 
     # ------------------------------------------------------------------
-    # Step 7: Reshape output → (batch, nchunks, nheads, headdim, dstate).
+    # Step 6: Reshape output → (batch, nchunks, nheads, headdim, dstate).
     #
     #   states_flat: (BCH, headdim_padded, dstate_padded)
     #   slice:       (BCH, headdim, dstate)
