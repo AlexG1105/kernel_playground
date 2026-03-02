@@ -137,10 +137,10 @@ def _chunk_state_kernel_body(
     def _with_acc(acc_ref):
         # Pipeline body: TMA loads into swizzled SMEM, then WGMMA accumulates.
         # acc_ref is captured from closure (allocated outside the pipeline).
-        def pipeline_body(step, a_smem, b_smem, carry):
+        # No init_carry → body receives (indices, *in_smems) only, no carry.
+        def pipeline_body(step, a_smem, b_smem):
             plgpu.wgmma(acc_ref, a_smem, b_smem)
             plgpu.wgmma_wait(0)
-            return ()
 
         plgpu.emit_pipeline(
             pipeline_body,
