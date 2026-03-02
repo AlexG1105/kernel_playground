@@ -241,11 +241,11 @@ def _naive_chunk_state(x, B, dt, dA_cumsum):
     # scale → (batch, nchunks, nheads, chunk_size)
     scale_t = scale.transpose(0, 2, 1, 3)
 
-    # B_scaled: (batch, nchunks, nheads, chunk_size, dstate)
-    B_scaled = B_exp * scale_t[:, :, :, :, None]
+    # B_pre: (batch, nchunks, nheads, chunk_size, dstate)
+    B_pre = B_exp * scale_t[:, :, :, :, None]
 
-    # states = x @ B_scaled → (batch, nchunks, nheads, headdim, dstate)
-    states = jnp.matmul(x, B_scaled)
+    # states = x @ B_pre → (batch, nchunks, nheads, headdim, dstate)
+    states = jnp.matmul(x, B_pre)
     return states
 
 
@@ -368,33 +368,34 @@ def benchmark_state(
 
     # ── Kernel-only (pre-processed bf16 inputs → Pallas kernel) ──
     # Call preprocess eagerly (not through JIT) so meta dict has Python ints
-    x_flat, B_scaled, meta = chunk_state_preprocess(
+    x_flat, B_pre, meta = chunk_state_preprocess(
         x_j, B_j, dt_j, dA_j, BM=BM, BK=BK, BN=BN,
     )
-    jax.block_until_ready((x_flat, B_scaled))
+    jax.block_until_ready((x_flat, B_pre))
 
-    fn_kern = jax.jit(lambda xf, bs: chunk_state_kernel_only(
-        xf, bs,
+    fn_kern = jax.jit(lambda xf, bf: chunk_state_kernel_only(
+        xf, bf,
         BM=BM, BK=meta['BK'], BN=BN,
-        BCH=meta['BCH'], headdim=meta['headdim'],
-        headdim_padded=meta['headdim_padded'],
+        BCH=meta['BCH'], BCG=meta['BCG'],
+        headdim=meta['headdim'], headdim_padded=meta['headdim_padded'],
         dstate=meta['dstate'], dstate_padded=meta['dstate_padded'],
         batch=meta['batch'], nchunks=meta['nchunks'],
-        nheads=meta['nheads'], chunk_size=meta['chunk_size'],
+        nheads=meta['nheads'], ngroups=meta['ngroups'],
+        chunk_size=meta['chunk_size'],
     ))
-    out_kern = fn_kern(x_flat, B_scaled)
+    out_kern = fn_kern(x_flat, B_pre)
     jax.block_until_ready(out_kern)
 
     if _HAS_TRITON:
         ms_kern = do_bench(
-            lambda: jax.block_until_ready(fn_kern(x_flat, B_scaled)),
+            lambda: jax.block_until_ready(fn_kern(x_flat, B_pre)),
             warmup=warmup, rep=rep,
         )
     else:
         times_kern = []
         for _ in range(warmup + rep):
             t0 = time.perf_counter()
-            jax.block_until_ready(fn_kern(x_flat, B_scaled))
+            jax.block_until_ready(fn_kern(x_flat, B_pre))
             times_kern.append(time.perf_counter() - t0)
         ms_kern = float(np.median(times_kern[warmup:])) * 1e3
 
@@ -406,10 +407,10 @@ def benchmark_state(
         + batch * nheads * nchunks * chunk_size * 4    # dA_cumsum
         + batch * nchunks * nheads * headdim * dstate * 4  # states out
     )
-    # Kernel-only bytes: read x_flat (bf16) + B_scaled (bf16), write states (f32)
+    # Kernel-only bytes: read x_flat (bf16) + B_flat (bf16, group-indexed), write states (f32)
     bytes_kern = (
-        meta['BCH'] * meta['headdim_padded'] * meta['chunk_size'] * 2   # x_flat bf16
-        + meta['BCH'] * meta['chunk_size'] * meta['dstate_padded'] * 2  # B_scaled bf16
+        meta['BCH'] * meta['headdim_padded'] * meta['chunk_size'] * 2   # x_scaled bf16
+        + meta['BCG'] * meta['chunk_size'] * meta['dstate_padded'] * 2  # B_flat bf16 (group)
         + batch * nchunks * nheads * headdim * dstate * 4               # states out f32
     )
     gbps = bytes_io / (ms * 1e-3) / 1e9
@@ -493,6 +494,8 @@ if __name__ == "__main__":
         # Nemotron-style: many heads, many groups
         (1,  256, 64,  64,  64,  8,  64, 64, 64, 64),
         (2,  512, 64,  64,  64,  8, 128, 64, 64, 64),
+        # Nemotron-H-56B: nheads=256, headdim=64, dstate=256, ngroups=8
+        (1, 2048, 256, 64, 256,  8, 256, 64, 64, 64),
     ]
     for cfg in state_configs:
         all_passed &= test_state_correctness(*cfg)
@@ -527,6 +530,8 @@ if __name__ == "__main__":
         (8,  4096, 64,  64,  64, 8, 256, 64, 64, 64),
         (2,  2048, 64, 128,  64, 8, 256, 64, 64, 64),
         (1,  2048, 64,  64, 128, 8, 256, 64, 64, 64),
+        # Nemotron-H-56B
+        (1,  2048, 256, 64, 256, 8, 256, 64, 64, 64),
     ]
     for cfg in state_bench_configs:
         benchmark_state(*cfg)

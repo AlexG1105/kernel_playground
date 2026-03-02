@@ -52,15 +52,19 @@ stages tiles into SMEM before the kernel runs, but emit_pipeline needs
 GMEM refs (it does its own TMA).  Writing from registers to
 WGMMA-transformed SMEM is not supported (WGStridedFragLayout error).
 
-Scale and group mapping precomputed in wrapper
-----------------------------------------------
+Scale folded into x, B stays group-indexed
+-------------------------------------------
   scale = exp(min(dA_cs_last - dA_cumsum, 0)) * dt
-  B_scaled = B_expanded[head→group] * scale[:, :, None]
+  x_scaled = x_T * scale[None, :]     (scale broadcast over headdim)
+  states = x_scaled @ B               (B is per-group, no expansion)
 
-  This is done in JAX/XLA before the kernel, so the kernel only sees
-  B_scaled indexed by BCH (no group mapping, no scale input).
+  Math: states = x_T @ diag(scale) @ B = (x_T * scale) @ B
 
-  Both x_T and B_scaled are cast to bf16 in the wrapper since H100
+  Scale is folded into x (not B) so that B stays group-indexed (BCG)
+  without replication.  The kernel maps bch→bcg to read the correct
+  group's B slice.  Multiple heads share B data via L2 cache.
+
+  Both x_scaled and B are cast to bf16 in the wrapper since H100
   WGMMA requires bf16 (or f16/tf32/fp8) operands.  The WGMMA
   accumulator is f32, preserving precision in the reduction.
 
@@ -95,8 +99,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 # ---------------------------------------------------------------------------
 
 def _chunk_state_kernel_body(
-    x_t_ref,    # GMEM ref: (BCH, headdim_padded, chunk_size) bf16
-    B_ref,      # GMEM ref: (BCH, chunk_size, dstate_padded) bf16  (pre-scaled)
+    x_t_ref,    # GMEM ref: (BCH, headdim_padded, chunk_size) bf16  (scale folded in)
+    B_ref,      # GMEM ref: (BCG, chunk_size, dstate_padded) bf16   (group-indexed)
     states_ref, # GMEM ref: (BCH, headdim_padded, dstate_padded) f32
     *,
     BM: int,
@@ -104,6 +108,8 @@ def _chunk_state_kernel_body(
     BN: int,
     chunk_size: int,
     num_stages: int,
+    nheads: int,
+    ngroups: int,
 ):
     """
     One CTA computes one (BM, BN) output tile for a given (bch, pm, pn).
@@ -111,6 +117,10 @@ def _chunk_state_kernel_body(
     Uses emit_pipeline for double-buffered TMA loading of bf16 tiles
     into WGMMA-compatible swizzled SMEM.  The pipeline body passes
     swizzled SMEM refs directly to wgmma (no intermediate register copy).
+
+    B is indexed by group (BCG), not head (BCH).  Each CTA computes
+    bcg = f(bch) to read the correct group's B slice.  Multiple heads
+    within the same group share B data via L2 cache.
     """
     bch = lax.axis_index("bch")
     pm  = lax.axis_index("pm")
@@ -118,9 +128,15 @@ def _chunk_state_kernel_body(
 
     K = chunk_size // BK
 
+    # Map bch → bcg for group-indexed B lookup
+    ratio = nheads // ngroups
+    chunk_batch = bch // nheads              # batch_idx * nchunks + chunk_idx
+    head_idx = bch % nheads
+    bcg = chunk_batch * ngroups + head_idx // ratio
+
     # GMEM sub-refs for this CTA's portion of the arrays
     x_t_gmem = x_t_ref.at[bch, pl.ds(pm * BM, BM), :]     # (BM, chunk_size) bf16
-    B_gmem   = B_ref.at[bch, :, pl.ds(pn * BN, BN)]        # (chunk_size, BN) bf16
+    B_gmem   = B_ref.at[bcg, :, pl.ds(pn * BN, BN)]        # (chunk_size, BN) bf16
 
     # Swizzle/tiling transforms for WGMMA-compatible SMEM layout
     a_swizzle = plgpu.find_swizzle(BK * 16)                 # 16 bits per bf16
@@ -180,19 +196,24 @@ def chunk_state_preprocess(
     BN: int = 64,
 ):
     """
-    Preprocess inputs for the Pallas kernel: scale, reshape, pad, bf16 cast.
+    Preprocess inputs for the Pallas kernel.
+
+    Scale is folded into x (not B), so B stays group-indexed (BCG)
+    instead of being expanded to head-indexed (BCH).  This reduces
+    B memory by nheads/ngroups (the group ratio).
+
+    Math: states = x_T @ diag(scale) @ B = (x_T * scale) @ B
 
     Returns
     -------
-    x_flat    : (BCH, headdim_padded, chunk_size) bf16
-    B_scaled  : (BCH, chunk_size, dstate_padded) bf16
-    meta      : dict with BCH, headdim, headdim_padded, dstate, dstate_padded,
-                batch, nchunks, nheads, chunk_size, BK
+    x_scaled  : (BCH, headdim_padded, chunk_size) bf16  — scale folded in
+    B_flat    : (BCG, chunk_size, dstate_padded) bf16    — group-indexed
+    meta      : dict with BCH, BCG, headdim, headdim_padded, dstate,
+                dstate_padded, batch, nchunks, nheads, ngroups, chunk_size, BK
     """
     batch, seqlen, nheads, headdim = x.shape
     _, nheads_, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = B.shape
-    ratio = nheads // ngroups
 
     assert nheads % ngroups == 0
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
@@ -208,49 +229,44 @@ def chunk_state_preprocess(
         x = jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)))
         B = jnp.pad(B, ((0, 0), (0, pad), (0, 0), (0, 0)))
 
-    # Scale
+    # Scale: (batch, nheads, nchunks, chunk_size)
     dA_cs_last = dA_cumsum[:, :, :, -1:]
     scale = jnp.exp(jnp.minimum(dA_cs_last - dA_cumsum, 0.0)) * dt
 
-    # Reshape x → (BCH, headdim_padded, chunk_size) bf16
+    # Reshape x → (BCH, headdim, chunk_size), fold scale into x
     x = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-    x_t = x.transpose(0, 1, 3, 4, 2)
+    x_t = x.transpose(0, 1, 3, 4, 2)           # (batch, nchunks, nheads, headdim, chunk_size)
     BCH = batch * nchunks * nheads
     x_flat = x_t.reshape(BCH, headdim, chunk_size)
+
+    # scale → (BCH, chunk_size), broadcast over headdim
+    scale_t = scale.transpose(0, 2, 1, 3)       # (batch, nchunks, nheads, chunk_size)
+    scale_flat = scale_t.reshape(BCH, chunk_size)
+    x_flat = x_flat * scale_flat[:, None, :]     # (BCH, headdim, chunk_size) * (BCH, 1, chunk_size)
 
     headdim_padded = math.ceil(headdim / BM) * BM
     if headdim_padded > headdim:
         x_flat = jnp.pad(x_flat, ((0, 0), (0, headdim_padded - headdim), (0, 0)))
     x_flat = x_flat.astype(jnp.bfloat16)
 
-    # Pre-scale B → (BCH, chunk_size, dstate_padded) bf16
+    # Reshape B → (BCG, chunk_size, dstate_padded) bf16  (group-indexed, no expansion)
     B = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-    B = B.transpose(0, 1, 3, 2, 4)
+    B = B.transpose(0, 1, 3, 2, 4)              # (batch, nchunks, ngroups, chunk_size, dstate)
     BCG = batch * nchunks * ngroups
     B_flat = B.reshape(BCG, chunk_size, dstate)
 
     dstate_padded = math.ceil(dstate / BN) * BN
     if dstate_padded > dstate:
         B_flat = jnp.pad(B_flat, ((0, 0), (0, 0), (0, dstate_padded - dstate)))
-
-    bch_indices = jnp.arange(BCH)
-    chunk_batch = bch_indices // nheads
-    head_idx = bch_indices % nheads
-    group_idx = head_idx // ratio
-    bcg_indices = chunk_batch * ngroups + group_idx
-    B_expanded = B_flat[bcg_indices]
-
-    scale_t = scale.transpose(0, 2, 1, 3)
-    scale_flat = scale_t.reshape(BCH, chunk_size)
-    B_scaled = (B_expanded * scale_flat[:, :, None]).astype(jnp.bfloat16)
+    B_flat = B_flat.astype(jnp.bfloat16)
 
     meta = dict(
-        BCH=BCH, headdim=headdim, headdim_padded=headdim_padded,
+        BCH=BCH, BCG=BCG, headdim=headdim, headdim_padded=headdim_padded,
         dstate=dstate, dstate_padded=dstate_padded,
-        batch=batch, nchunks=nchunks, nheads=nheads,
+        batch=batch, nchunks=nchunks, nheads=nheads, ngroups=ngroups,
         chunk_size=chunk_size, BK=BK,
     )
-    return x_flat, B_scaled, meta
+    return x_flat, B_flat, meta
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +274,11 @@ def chunk_state_preprocess(
 # ---------------------------------------------------------------------------
 
 def chunk_state_kernel_only(
-    x_flat,     # (BCH, headdim_padded, chunk_size) bf16
-    B_scaled,   # (BCH, chunk_size, dstate_padded) bf16
+    x_flat,     # (BCH, headdim_padded, chunk_size) bf16  (scale folded in)
+    B_flat,     # (BCG, chunk_size, dstate_padded) bf16   (group-indexed)
     *,
     BCH: int,
+    BCG: int,
     headdim: int,
     headdim_padded: int,
     dstate: int,
@@ -269,6 +286,7 @@ def chunk_state_kernel_only(
     batch: int,
     nchunks: int,
     nheads: int,
+    ngroups: int,
     chunk_size: int,
     BM: int = 64,
     BK: int = 64,
@@ -279,6 +297,7 @@ def chunk_state_kernel_only(
     Launch just the Pallas kernel + output reshape.
 
     Takes pre-processed bf16 inputs (from chunk_state_preprocess).
+    B is group-indexed (BCG); the kernel maps bch→bcg internally.
     """
     PM = headdim_padded // BM
     PN = dstate_padded  // BN
@@ -294,6 +313,8 @@ def chunk_state_kernel_only(
             BM=BM, BK=BK, BN=BN,
             chunk_size=chunk_size,
             num_stages=num_stages,
+            nheads=nheads,
+            ngroups=ngroups,
         ),
         out_shape=jax.ShapeDtypeStruct(
             (BCH, headdim_padded, dstate_padded), jnp.float32
@@ -301,7 +322,7 @@ def chunk_state_kernel_only(
         mesh=mesh,
     )
 
-    states_flat = kernel_fn(x_flat, B_scaled)
+    states_flat = kernel_fn(x_flat, B_flat)
 
     states = (
         states_flat[:, :headdim, :dstate]
@@ -342,15 +363,16 @@ def chunk_state_fwd_mosaic(
 
     Same semantics as the Triton reference _chunk_state_fwd.
     """
-    x_flat, B_scaled, meta = chunk_state_preprocess(
+    x_flat, B_flat, meta = chunk_state_preprocess(
         x, B, dt, dA_cumsum, BM=BM, BK=BK, BN=BN,
     )
     return chunk_state_kernel_only(
-        x_flat, B_scaled,
+        x_flat, B_flat,
         BM=BM, BK=meta['BK'], BN=BN, num_stages=num_stages,
         **{k: meta[k] for k in (
-            'BCH', 'headdim', 'headdim_padded', 'dstate', 'dstate_padded',
-            'batch', 'nchunks', 'nheads', 'chunk_size',
+            'BCH', 'BCG', 'headdim', 'headdim_padded', 'dstate',
+            'dstate_padded', 'batch', 'nchunks', 'nheads', 'ngroups',
+            'chunk_size',
         )},
     )
 
