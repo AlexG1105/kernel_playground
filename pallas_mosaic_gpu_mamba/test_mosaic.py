@@ -27,7 +27,11 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pallas_mosaic_gpu_mamba.chunk_cumsum_fwd import chunk_cumsum_fwd_mosaic
-from pallas_mosaic_gpu_mamba.chunk_state_fwd import chunk_state_fwd_mosaic
+from pallas_mosaic_gpu_mamba.chunk_state_fwd import (
+    chunk_state_fwd_mosaic,
+    chunk_state_preprocess,
+    chunk_state_kernel_only,
+)
 
 # ---------------------------------------------------------------------------
 # Optional Triton reference (may not be available on all machines).
@@ -323,6 +327,26 @@ def benchmark_state(
         axis=3,
     )
 
+    # ── Naive JAX (jnp.matmul baseline) ──
+    fn_naive = jax.jit(lambda x, B, dt, dA: _naive_chunk_state(x, B, dt, dA))
+    jax.block_until_ready(fn_naive(x_j, B_j, dt_j, dA_j))
+
+    if _HAS_TRITON:
+        from triton.testing import do_bench
+        ms_naive = do_bench(
+            lambda: jax.block_until_ready(fn_naive(x_j, B_j, dt_j, dA_j)),
+            warmup=warmup, rep=rep,
+        )
+    else:
+        import time
+        times_naive = []
+        for _ in range(warmup + rep):
+            t0 = time.perf_counter()
+            jax.block_until_ready(fn_naive(x_j, B_j, dt_j, dA_j))
+            times_naive.append(time.perf_counter() - t0)
+        ms_naive = float(np.median(times_naive[warmup:])) * 1e3
+
+    # ── End-to-end (preprocess + kernel) ──
     fn = jax.jit(lambda x, B, dt, dA: chunk_state_fwd_mosaic(
         x, B, dt, dA, BM=BM, BK=BK, BN=BN,
     ))
@@ -330,19 +354,49 @@ def benchmark_state(
     jax.block_until_ready(out)
 
     if _HAS_TRITON:
-        from triton.testing import do_bench
         ms = do_bench(
             lambda: jax.block_until_ready(fn(x_j, B_j, dt_j, dA_j)),
             warmup=warmup, rep=rep,
         )
     else:
-        import time
         times = []
         for _ in range(warmup + rep):
             t0 = time.perf_counter()
             jax.block_until_ready(fn(x_j, B_j, dt_j, dA_j))
             times.append(time.perf_counter() - t0)
         ms = float(np.median(times[warmup:])) * 1e3
+
+    # ── Kernel-only (pre-processed bf16 inputs → Pallas kernel) ──
+    # Call preprocess eagerly (not through JIT) so meta dict has Python ints
+    x_flat, B_scaled, meta = chunk_state_preprocess(
+        x_j, B_j, dt_j, dA_j, BM=BM, BK=BK, BN=BN,
+    )
+    jax.block_until_ready((x_flat, B_scaled))
+
+    fn_kern = jax.jit(lambda xf, bs: chunk_state_kernel_only(
+        xf, bs,
+        BM=BM, BK=meta['BK'], BN=BN,
+        BCH=meta['BCH'], headdim=meta['headdim'],
+        headdim_padded=meta['headdim_padded'],
+        dstate=meta['dstate'], dstate_padded=meta['dstate_padded'],
+        batch=meta['batch'], nchunks=meta['nchunks'],
+        nheads=meta['nheads'], chunk_size=meta['chunk_size'],
+    ))
+    out_kern = fn_kern(x_flat, B_scaled)
+    jax.block_until_ready(out_kern)
+
+    if _HAS_TRITON:
+        ms_kern = do_bench(
+            lambda: jax.block_until_ready(fn_kern(x_flat, B_scaled)),
+            warmup=warmup, rep=rep,
+        )
+    else:
+        times_kern = []
+        for _ in range(warmup + rep):
+            t0 = time.perf_counter()
+            jax.block_until_ready(fn_kern(x_flat, B_scaled))
+            times_kern.append(time.perf_counter() - t0)
+        ms_kern = float(np.median(times_kern[warmup:])) * 1e3
 
     # Bytes: read x + B + dt + dA_cumsum, write states  (all float32)
     bytes_io = (
@@ -352,8 +406,19 @@ def benchmark_state(
         + batch * nheads * nchunks * chunk_size * 4    # dA_cumsum
         + batch * nchunks * nheads * headdim * dstate * 4  # states out
     )
+    # Kernel-only bytes: read x_flat (bf16) + B_scaled (bf16), write states (f32)
+    bytes_kern = (
+        meta['BCH'] * meta['headdim_padded'] * meta['chunk_size'] * 2   # x_flat bf16
+        + meta['BCH'] * meta['chunk_size'] * meta['dstate_padded'] * 2  # B_scaled bf16
+        + batch * nchunks * nheads * headdim * dstate * 4               # states out f32
+    )
     gbps = bytes_io / (ms * 1e-3) / 1e9
-    print(f"  Mosaic GPU : {ms:.3f} ms   {gbps:.1f} GB/s")
+    gbps_naive = bytes_io / (ms_naive * 1e-3) / 1e9
+    gbps_kern = bytes_kern / (ms_kern * 1e-3) / 1e9
+    print(f"  Naive JAX (matmul) : {ms_naive:.3f} ms   {gbps_naive:.1f} GB/s")
+    print(f"  Mosaic end-to-end  : {ms:.3f} ms   {gbps:.1f} GB/s")
+    print(f"  Mosaic kernel-only : {ms_kern:.3f} ms   {gbps_kern:.1f} GB/s")
+    print(f"  Mosaic preprocess  : {ms - ms_kern:.3f} ms  ({(ms - ms_kern)/ms*100:.0f}% of total)")
 
     if _HAS_TRITON:
         import torch
@@ -369,8 +434,16 @@ def benchmark_state(
 
         ms_tri  = do_bench(_triton_fn, warmup=warmup, rep=rep)
         gbps_tri = bytes_io / (ms_tri * 1e-3) / 1e9
-        print(f"  Triton     : {ms_tri:.3f} ms   {gbps_tri:.1f} GB/s")
-        print(f"  Ratio (Mosaic/Triton): {ms/ms_tri:.2f}x")
+        print(f"  Triton             : {ms_tri:.3f} ms   {gbps_tri:.1f} GB/s")
+
+    # ── Summary ratios ──
+    print(f"  ── Ratios ──")
+    print(f"  Mosaic e2e   / Naive : {ms/ms_naive:.2f}x")
+    print(f"  Mosaic kernel/ Naive : {ms_kern/ms_naive:.2f}x")
+    if _HAS_TRITON:
+        print(f"  Mosaic e2e   / Triton: {ms/ms_tri:.2f}x")
+        print(f"  Mosaic kernel/ Triton: {ms_kern/ms_tri:.2f}x")
+        print(f"  Naive        / Triton: {ms_naive/ms_tri:.2f}x")
 
 
 # ===========================================================================

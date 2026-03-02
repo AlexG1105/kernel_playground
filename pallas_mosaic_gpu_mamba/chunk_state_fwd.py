@@ -167,7 +167,151 @@ def _chunk_state_kernel_body(
 
 
 # ---------------------------------------------------------------------------
-# Public wrapper
+# Preprocessing (JAX/XLA ops — scale, reshape, pad, bf16 cast)
+# ---------------------------------------------------------------------------
+
+def chunk_state_preprocess(
+    x,          # (batch, seqlen, nheads, headdim)            float32
+    B,          # (batch, seqlen, ngroups, dstate)            float32
+    dt,         # (batch, nheads, nchunks, chunk_size)        float32
+    dA_cumsum,  # (batch, nheads, nchunks, chunk_size)        float32
+    BM: int = 64,
+    BK: int = 64,
+    BN: int = 64,
+):
+    """
+    Preprocess inputs for the Pallas kernel: scale, reshape, pad, bf16 cast.
+
+    Returns
+    -------
+    x_flat    : (BCH, headdim_padded, chunk_size) bf16
+    B_scaled  : (BCH, chunk_size, dstate_padded) bf16
+    meta      : dict with BCH, headdim, headdim_padded, dstate, dstate_padded,
+                batch, nchunks, nheads, chunk_size, BK
+    """
+    batch, seqlen, nheads, headdim = x.shape
+    _, nheads_, nchunks, chunk_size = dt.shape
+    _, _, ngroups, dstate = B.shape
+    ratio = nheads // ngroups
+
+    assert nheads % ngroups == 0
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+
+    BK = min(BK, chunk_size)
+    assert chunk_size % BK == 0
+
+    # Pad seqlen
+    total_len = nchunks * chunk_size
+    if seqlen < total_len:
+        pad = total_len - seqlen
+        x = jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        B = jnp.pad(B, ((0, 0), (0, pad), (0, 0), (0, 0)))
+
+    # Scale
+    dA_cs_last = dA_cumsum[:, :, :, -1:]
+    scale = jnp.exp(jnp.minimum(dA_cs_last - dA_cumsum, 0.0)) * dt
+
+    # Reshape x → (BCH, headdim_padded, chunk_size) bf16
+    x = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
+    x_t = x.transpose(0, 1, 3, 4, 2)
+    BCH = batch * nchunks * nheads
+    x_flat = x_t.reshape(BCH, headdim, chunk_size)
+
+    headdim_padded = math.ceil(headdim / BM) * BM
+    if headdim_padded > headdim:
+        x_flat = jnp.pad(x_flat, ((0, 0), (0, headdim_padded - headdim), (0, 0)))
+    x_flat = x_flat.astype(jnp.bfloat16)
+
+    # Pre-scale B → (BCH, chunk_size, dstate_padded) bf16
+    B = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
+    B = B.transpose(0, 1, 3, 2, 4)
+    BCG = batch * nchunks * ngroups
+    B_flat = B.reshape(BCG, chunk_size, dstate)
+
+    dstate_padded = math.ceil(dstate / BN) * BN
+    if dstate_padded > dstate:
+        B_flat = jnp.pad(B_flat, ((0, 0), (0, 0), (0, dstate_padded - dstate)))
+
+    bch_indices = jnp.arange(BCH)
+    chunk_batch = bch_indices // nheads
+    head_idx = bch_indices % nheads
+    group_idx = head_idx // ratio
+    bcg_indices = chunk_batch * ngroups + group_idx
+    B_expanded = B_flat[bcg_indices]
+
+    scale_t = scale.transpose(0, 2, 1, 3)
+    scale_flat = scale_t.reshape(BCH, chunk_size)
+    B_scaled = (B_expanded * scale_flat[:, :, None]).astype(jnp.bfloat16)
+
+    meta = dict(
+        BCH=BCH, headdim=headdim, headdim_padded=headdim_padded,
+        dstate=dstate, dstate_padded=dstate_padded,
+        batch=batch, nchunks=nchunks, nheads=nheads,
+        chunk_size=chunk_size, BK=BK,
+    )
+    return x_flat, B_scaled, meta
+
+
+# ---------------------------------------------------------------------------
+# Kernel-only launch (no preprocessing)
+# ---------------------------------------------------------------------------
+
+def chunk_state_kernel_only(
+    x_flat,     # (BCH, headdim_padded, chunk_size) bf16
+    B_scaled,   # (BCH, chunk_size, dstate_padded) bf16
+    *,
+    BCH: int,
+    headdim: int,
+    headdim_padded: int,
+    dstate: int,
+    dstate_padded: int,
+    batch: int,
+    nchunks: int,
+    nheads: int,
+    chunk_size: int,
+    BM: int = 64,
+    BK: int = 64,
+    BN: int = 64,
+    num_stages: int = 2,
+) -> jnp.ndarray:
+    """
+    Launch just the Pallas kernel + output reshape.
+
+    Takes pre-processed bf16 inputs (from chunk_state_preprocess).
+    """
+    PM = headdim_padded // BM
+    PN = dstate_padded  // BN
+
+    mesh = plgpu.Mesh(
+        grid=(BCH, PM, PN),
+        grid_names=("bch", "pm", "pn"),
+    )
+
+    kernel_fn = pl.kernel(
+        partial(
+            _chunk_state_kernel_body,
+            BM=BM, BK=BK, BN=BN,
+            chunk_size=chunk_size,
+            num_stages=num_stages,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (BCH, headdim_padded, dstate_padded), jnp.float32
+        ),
+        mesh=mesh,
+    )
+
+    states_flat = kernel_fn(x_flat, B_scaled)
+
+    states = (
+        states_flat[:, :headdim, :dstate]
+        .reshape(batch, nchunks, nheads, headdim, dstate)
+    )
+    return states
+
+
+# ---------------------------------------------------------------------------
+# Public wrapper (end-to-end: preprocess + kernel)
 # ---------------------------------------------------------------------------
 
 def chunk_state_fwd_mosaic(
@@ -198,141 +342,17 @@ def chunk_state_fwd_mosaic(
 
     Same semantics as the Triton reference _chunk_state_fwd.
     """
-    batch, seqlen, nheads, headdim = x.shape
-    _, nheads_, nchunks, chunk_size = dt.shape
-    _, _, ngroups, dstate = B.shape
-    ratio = nheads // ngroups  # Python int — constant
-
-    assert nheads % ngroups == 0, f"nheads={nheads} must be divisible by ngroups={ngroups}"
-    assert dt.shape == (batch, nheads, nchunks, chunk_size)
-    assert dA_cumsum.shape == dt.shape
-
-    # Adapt BK to chunk_size if necessary
-    BK = min(BK, chunk_size)
-    assert chunk_size % BK == 0, f"chunk_size={chunk_size} must be divisible by BK={BK}"
-
-    # ------------------------------------------------------------------
-    # Step 1: Pad seqlen to nchunks * chunk_size.
-    # ------------------------------------------------------------------
-    total_len = nchunks * chunk_size
-    if seqlen < total_len:
-        pad = total_len - seqlen
-        x = jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)))
-        B = jnp.pad(B, ((0, 0), (0, pad), (0, 0), (0, 0)))
-
-    # ------------------------------------------------------------------
-    # Step 2: Precompute scale in JAX (avoids scalar GMEM reads in kernel).
-    #
-    #   dA_cs_last : (batch, nheads, nchunks, 1)
-    #   scale      : (batch, nheads, nchunks, chunk_size)
-    # ------------------------------------------------------------------
-    dA_cs_last = dA_cumsum[:, :, :, -1:]
-    scale = jnp.exp(jnp.minimum(dA_cs_last - dA_cumsum, 0.0)) * dt
-
-    # ------------------------------------------------------------------
-    # Step 3: Reshape x → (BCH, headdim_padded, chunk_size) bf16.
-    #
-    #   x: (batch, seqlen, nheads, headdim)
-    #   → (batch, nchunks, chunk_size, nheads, headdim)
-    #   → (batch, nchunks, nheads, headdim, chunk_size)   [transpose]
-    #   → (BCH, headdim, chunk_size)                      [reshape]
-    #   → (BCH, headdim_padded, chunk_size)               [pad]
-    #   → bf16
-    # ------------------------------------------------------------------
-    x = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-    x_t = x.transpose(0, 1, 3, 4, 2)           # (batch, nchunks, nheads, headdim, chunk_size)
-    BCH = batch * nchunks * nheads
-    x_flat = x_t.reshape(BCH, headdim, chunk_size)
-
-    headdim_padded = math.ceil(headdim / BM) * BM
-    if headdim_padded > headdim:
-        x_flat = jnp.pad(x_flat, ((0, 0), (0, headdim_padded - headdim), (0, 0)))
-
-    x_flat = x_flat.astype(jnp.bfloat16)       # WGMMA requires bf16
-
-    # ------------------------------------------------------------------
-    # Step 4: Pre-scale B and reshape to (BCH, chunk_size, dstate_padded) bf16.
-    #
-    #   B: (batch, seqlen, ngroups, dstate)
-    #   → (batch, nchunks, ngroups, chunk_size, dstate)
-    #   scale: (batch, nheads, nchunks, chunk_size)
-    #
-    #   We expand B from (BCG,) to (BCH,) by repeating each group's B
-    #   across its heads, then multiply by scale.  This avoids passing
-    #   scale as a separate kernel input and eliminates the group index
-    #   mapping inside the kernel.
-    # ------------------------------------------------------------------
-    B = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-    B = B.transpose(0, 1, 3, 2, 4)             # (batch, nchunks, ngroups, chunk_size, dstate)
-    BCG = batch * nchunks * ngroups
-    B_flat = B.reshape(BCG, chunk_size, dstate)
-
-    dstate_padded = math.ceil(dstate / BN) * BN
-    if dstate_padded > dstate:
-        B_flat = jnp.pad(B_flat, ((0, 0), (0, 0), (0, dstate_padded - dstate)))
-
-    # Map each bch index to its corresponding bcg index for group expansion.
-    #   bch = batch_idx*(nchunks*nheads) + chunk_idx*nheads + head_idx
-    #   bcg = (batch_idx*nchunks + chunk_idx)*ngroups + head_idx // ratio
-    bch_indices = jnp.arange(BCH)
-    chunk_batch = bch_indices // nheads          # batch_idx*nchunks + chunk_idx
-    head_idx = bch_indices % nheads
-    group_idx = head_idx // ratio
-    bcg_indices = chunk_batch * ngroups + group_idx
-
-    B_expanded = B_flat[bcg_indices]             # (BCH, chunk_size, dstate_padded)
-
-    # Flatten scale: (batch, nheads, nchunks, chunk_size)
-    #   → (batch, nchunks, nheads, chunk_size) → (BCH, chunk_size)
-    scale_t = scale.transpose(0, 2, 1, 3)
-    scale_flat = scale_t.reshape(BCH, chunk_size)
-
-    # Pre-multiply: B_scaled[bch, t, :] = B[bcg, t, :] * scale[bch, t]
-    B_scaled = (B_expanded * scale_flat[:, :, None]).astype(jnp.bfloat16)
-
-    # ------------------------------------------------------------------
-    # Step 5: Launch Pallas Mosaic GPU kernel.
-    #
-    #   pl.kernel uses core_map to dispatch over a Mesh.  The kernel
-    #   body gets GMEM refs (not SMEM), which emit_pipeline can TMA-load
-    #   into swizzled SMEM for WGMMA.
-    # ------------------------------------------------------------------
-    PM = headdim_padded // BM
-    PN = dstate_padded  // BN
-
-    mesh = plgpu.Mesh(
-        grid=(BCH, PM, PN),
-        grid_names=("bch", "pm", "pn"),
+    x_flat, B_scaled, meta = chunk_state_preprocess(
+        x, B, dt, dA_cumsum, BM=BM, BK=BK, BN=BN,
     )
-
-    kernel_fn = pl.kernel(
-        partial(
-            _chunk_state_kernel_body,
-            BM=BM, BK=BK, BN=BN,
-            chunk_size=chunk_size,
-            num_stages=num_stages,
-        ),
-        out_shape=jax.ShapeDtypeStruct(
-            (BCH, headdim_padded, dstate_padded), jnp.float32
-        ),
-        mesh=mesh,
+    return chunk_state_kernel_only(
+        x_flat, B_scaled,
+        BM=BM, BK=meta['BK'], BN=BN, num_stages=num_stages,
+        **{k: meta[k] for k in (
+            'BCH', 'headdim', 'headdim_padded', 'dstate', 'dstate_padded',
+            'batch', 'nchunks', 'nheads', 'chunk_size',
+        )},
     )
-
-    states_flat = kernel_fn(x_flat, B_scaled)
-
-    # ------------------------------------------------------------------
-    # Step 6: Reshape output → (batch, nchunks, nheads, headdim, dstate).
-    #
-    #   states_flat: (BCH, headdim_padded, dstate_padded)
-    #   slice:       (BCH, headdim, dstate)
-    #   reshape:     (batch, nchunks, nheads, headdim, dstate)
-    # ------------------------------------------------------------------
-    states = (
-        states_flat[:, :headdim, :dstate]
-        .reshape(batch, nchunks, nheads, headdim, dstate)
-    )
-
-    return states
 
 
 # ---------------------------------------------------------------------------
