@@ -48,3 +48,7 @@ Where the biggest wins would come from:
 Fusing B group expansion into the kernel (read B by group, broadcast in registers) — would cut B memory traffic by ratiox
 Fusing scale computation into the kernel — eliminate the pre-multiply GMEM round-trip
 Both require moving away from the clean emit_pipeline → WGMMA pattern toward a more manual approach where we do math between TMA loads and WGMMA calls, which the current Mosaic GPU API makes difficult
+
+TODO:
+
+chunk_cumsum check jnp cumsum is supported in kernel? test_cumsum_minimal.py

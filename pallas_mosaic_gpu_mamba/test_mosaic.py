@@ -203,7 +203,7 @@ def benchmark_cumsum(
 # chunk_state_fwd
 # ===========================================================================
 
-def _naive_chunk_state(x, B, dt, dA_cumsum):
+def _naive_chunk_state(x, B, dt, dA_cumsum, seq_idx=None):
     """
     Naive JAX reference for chunk_state_fwd.
 
@@ -211,6 +211,7 @@ def _naive_chunk_state(x, B, dt, dA_cumsum):
     B         : (batch, seqlen, ngroups, dstate)
     dt        : (batch, nheads, nchunks, chunk_size)   (post-processed)
     dA_cumsum : (batch, nheads, nchunks, chunk_size)
+    seq_idx   : (batch, seqlen) or None
 
     Returns states : (batch, nchunks, nheads, headdim, dstate)
     """
@@ -225,10 +226,26 @@ def _naive_chunk_state(x, B, dt, dA_cumsum):
         pad = total_len - seqlen
         x = jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)))
         B = jnp.pad(B, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        if seq_idx is not None:
+            seq_idx = jnp.pad(seq_idx, ((0, 0), (0, pad)), constant_values=-1)
 
     # scale: (batch, nheads, nchunks, chunk_size)
     dA_cs_last = dA_cumsum[:, :, :, -1:]
     scale = jnp.exp(jnp.minimum(dA_cs_last - dA_cumsum, 0.0)) * dt
+
+    # Handle seq_idx: zero scale where seq_idx[k] != seq_idx[chunk_end]
+    if seq_idx is not None:
+        chunk_ends = np.minimum(
+            np.arange(1, nchunks + 1) * chunk_size, seqlen
+        ) - 1
+        seq_idx_last = seq_idx[:, chunk_ends]  # (batch, nchunks)
+        seq_idx_chunked = seq_idx.reshape(batch, nchunks, chunk_size)
+        same_seq = (seq_idx_last[:, :, None] >= 0) & (
+            seq_idx_chunked == seq_idx_last[:, :, None]
+        )  # (batch, nchunks, chunk_size)
+        # scale is (batch, nheads, nchunks, chunk_size)
+        # same_seq is (batch, nchunks, chunk_size) → need (batch, 1, nchunks, chunk_size)
+        scale = jnp.where(same_seq[:, None, :, :], scale, 0.0)
 
     # x → (batch, nchunks, nheads, headdim, chunk_size)
     x = x.reshape(batch, nchunks, chunk_size, nheads, headdim).transpose(0, 1, 3, 4, 2)
@@ -249,10 +266,32 @@ def _naive_chunk_state(x, B, dt, dA_cumsum):
     return states
 
 
+def _build_seq_idx(batch, seqlen, seq_lengths_per_batch):
+    """
+    Build a seq_idx array from per-batch sequence lengths.
+
+    seq_lengths_per_batch: list of list of ints, one per batch element.
+        e.g. [[100, 156], [200, 56]] for batch=2, seqlen=256
+    Returns: jnp.array of shape (batch, seqlen), dtype int32
+    """
+    seq_idx_list = []
+    for b in range(batch):
+        lens = seq_lengths_per_batch[b]
+        idx = []
+        for seq_id, l in enumerate(lens):
+            idx.extend([seq_id] * l)
+        idx = idx[:seqlen]
+        if len(idx) < seqlen:
+            idx.extend([idx[-1]] * (seqlen - len(idx)))
+        seq_idx_list.append(idx)
+    return jnp.array(seq_idx_list, dtype=jnp.int32)
+
+
 def test_state_correctness(
     batch=2, seqlen=512, nheads=8, headdim=64, dstate=64,
     ngroups=1, chunk_size=64,
     BM=64, BK=64, BN=64,
+    seq_idx_config=None,
     atol=1e-2,
 ):
     """
@@ -261,11 +300,14 @@ def test_state_correctness(
     dt and dA_cumsum are constructed directly in (batch, nheads, nchunks, chunk_size)
     format (i.e. they represent already-processed values, as produced by
     chunk_cumsum_fwd).
+
+    seq_idx_config: None or dict with key 'seq_lengths' (list of list of ints).
     """
     nchunks = math.ceil(seqlen / chunk_size)
+    seq_str = f"seq_idx={seq_idx_config is not None}"
     print(f"\n── [chunk_state_fwd] correctness  "
           f"B={batch} L={seqlen} H={nheads} D={headdim} S={dstate} "
-          f"G={ngroups} Q={chunk_size} BM={BM} BK={BK} BN={BN} ──")
+          f"G={ngroups} Q={chunk_size} BM={BM} BK={BK} BN={BN} {seq_str} ──")
 
     key = jax.random.PRNGKey(42)
     k1, k2, k3, k4 = jax.random.split(key, 4)
@@ -277,28 +319,41 @@ def test_state_correctness(
     dA_raw = -jax.random.uniform(k4, (batch, nheads, nchunks, chunk_size)) * 0.1
     dA_cumsum_jax = jnp.cumsum(dA_raw, axis=3)
 
+    # Build seq_idx if requested
+    seq_idx_jax = None
+    if seq_idx_config is not None:
+        seq_idx_jax = _build_seq_idx(batch, seqlen, seq_idx_config['seq_lengths'])
+        print(f"  seq_idx shape: {tuple(seq_idx_jax.shape)}")
+
     states_pal = chunk_state_fwd_mosaic(
         x_jax, B_jax, dt_jax, dA_cumsum_jax,
+        seq_idx=seq_idx_jax,
         BM=BM, BK=BK, BN=BN,
     )
     jax.block_until_ready(states_pal)
 
     print(f"  states shape : {tuple(states_pal.shape)}")
 
-    states_ref = _naive_chunk_state(x_jax, B_jax, dt_jax, dA_cumsum_jax)
+    states_ref = _naive_chunk_state(x_jax, B_jax, dt_jax, dA_cumsum_jax,
+                                    seq_idx=seq_idx_jax)
 
     all_ok = True
     all_ok &= check("states vs naive", states_pal, states_ref, atol=atol)
 
     if _HAS_TRITON:
-        # Triton reference: _chunk_state_fwd(B, x, dt, dA_cumsum)
-        # Its dt argument is (batch, nheads, nchunks, chunk_size).
-        # Its x argument is  (batch, seqlen, nheads, headdim).
+        import torch as _torch
+        # Triton reference: _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=...)
         B_t          = _to_torch(B_jax)
         x_t          = _to_torch(x_jax)
         dt_t         = _to_torch(dt_jax)
         dA_cumsum_t  = _to_torch(dA_cumsum_jax)
-        states_tri   = _triton_state_fwd(B_t, x_t, dt_t, dA_cumsum_t)
+        seq_idx_t = None
+        if seq_idx_jax is not None:
+            seq_idx_t = _torch.tensor(
+                np.array(seq_idx_jax), device="cuda", dtype=_torch.int32,
+            )
+        states_tri   = _triton_state_fwd(B_t, x_t, dt_t, dA_cumsum_t,
+                                         seq_idx=seq_idx_t)
         states_tri_j = jnp.array(states_tri.cpu().numpy())
         all_ok &= check("states vs Triton", states_pal, states_tri_j, atol=atol)
 
@@ -499,6 +554,51 @@ if __name__ == "__main__":
     ]
     for cfg in state_configs:
         all_passed &= test_state_correctness(*cfg)
+
+    # ── chunk_state_fwd seq_idx correctness ───────────────────────────────
+    print("\n" + "═" * 70)
+    print("CHUNK_STATE_FWD SEQ_IDX CORRECTNESS")
+    print("═" * 70)
+    state_seq_idx_configs = [
+        # (batch, seqlen, nheads, headdim, dstate, ngroups, chunk_size, BM, BK, BN, seq_idx_config)
+        # Single sequence (no-op)
+        (1, 256, 8, 64, 64, 1, 64, 64, 64, 64, {
+            'seq_lengths': [[256]],
+        }),
+        # Two sequences, boundary at chunk edge (seqlen=256, chunk_size=64)
+        (1, 256, 8, 64, 64, 1, 64, 64, 64, 64, {
+            'seq_lengths': [[128, 128]],  # boundary at position 128 = chunk 2
+        }),
+        # Two sequences, boundary mid-chunk
+        (2, 512, 8, 64, 64, 1, 128, 64, 64, 64, {
+            'seq_lengths': [
+                [200, 312],   # boundary at 200, mid-chunk 1 (chunk_size=128)
+                [100, 412],   # boundary at 100, mid-chunk 0
+            ],
+        }),
+        # Three sequences, multi-group
+        (2, 512, 16, 64, 64, 2, 128, 64, 64, 64, {
+            'seq_lengths': [
+                [128, 128, 256],
+                [64, 192, 256],
+            ],
+        }),
+        # Every chunk is a different sequence
+        (1, 256, 8, 64, 64, 1, 64, 64, 64, 64, {
+            'seq_lengths': [[64, 64, 64, 64]],
+        }),
+        # Nemotron-style with seq_idx
+        (1, 256, 64, 64, 64, 8, 64, 64, 64, 64, {
+            'seq_lengths': [[100, 156]],
+        }),
+    ]
+    for cfg in state_seq_idx_configs:
+        batch, seqlen, nheads, headdim, dstate, ngroups, chunk_size, BM, BK, BN, seq_cfg = cfg
+        all_passed &= test_state_correctness(
+            batch=batch, seqlen=seqlen, nheads=nheads, headdim=headdim,
+            dstate=dstate, ngroups=ngroups, chunk_size=chunk_size,
+            BM=BM, BK=BK, BN=BN, seq_idx_config=seq_cfg,
+        )
 
     print(f"\n{'═' * 70}")
     print(f"Overall: {'ALL TESTS PASS ✓' if all_passed else 'SOME TESTS FAILED ✗'}")

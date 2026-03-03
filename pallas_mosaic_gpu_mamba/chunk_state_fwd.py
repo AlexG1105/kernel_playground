@@ -10,12 +10,15 @@ Given:
   B         : (batch, seqlen, ngroups, dstate)   float32
   dt        : (batch, nheads, nchunks, chunk_size) float32   (post-softplus, post-clip)
   dA_cumsum : (batch, nheads, nchunks, chunk_size) float32
+  seq_idx   : (batch, seqlen) int32, optional — sequence index per position
 
 Produces:
   states : (batch, nchunks, nheads, headdim, dstate)  float32
 
 where for each (batch b, chunk c, head h, group g = h // ratio):
   scale[k]       = exp(min(dA_cumsum[b,h,c,-1] - dA_cumsum[b,h,c,k], 0)) * dt[b,h,c,k]
+  if seq_idx is not None and seq_idx[k] != seq_idx[chunk_end]:
+      scale[k]   = 0   (position belongs to a different sequence)
   states[b,c,h]  = x[b,c,:,h,:].T  @  (B[b,c,:,g,:] * scale[:,None])
                  = (headdim, chunk_size) @ (chunk_size, dstate)
                  = (headdim, dstate)
@@ -191,6 +194,7 @@ def chunk_state_preprocess(
     B,          # (batch, seqlen, ngroups, dstate)            float32
     dt,         # (batch, nheads, nchunks, chunk_size)        float32
     dA_cumsum,  # (batch, nheads, nchunks, chunk_size)        float32
+    seq_idx=None,  # (batch, seqlen) int32, optional
     BM: int = 64,
     BK: int = 64,
     BN: int = 64,
@@ -203,6 +207,12 @@ def chunk_state_preprocess(
     B memory by nheads/ngroups (the group ratio).
 
     Math: states = x_T @ diag(scale) @ B = (x_T * scale) @ B
+
+    When seq_idx is provided, positions where seq_idx[k] differs from
+    seq_idx at the last valid position of the chunk have their scale
+    zeroed out, so they don't contribute to the chunk state.  This
+    handles within-chunk sequence boundaries for packed variable-length
+    sequences.
 
     Returns
     -------
@@ -218,6 +228,8 @@ def chunk_state_preprocess(
     assert nheads % ngroups == 0
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == dt.shape
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
 
     BK = min(BK, chunk_size)
     assert chunk_size % BK == 0
@@ -228,10 +240,31 @@ def chunk_state_preprocess(
         pad = total_len - seqlen
         x = jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0)))
         B = jnp.pad(B, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        if seq_idx is not None:
+            # Pad seq_idx with -1 so padded positions never match seq_idx_last
+            seq_idx = jnp.pad(seq_idx, ((0, 0), (0, pad)), constant_values=-1)
 
     # Scale: (batch, nheads, nchunks, chunk_size)
     dA_cs_last = dA_cumsum[:, :, :, -1:]
     scale = jnp.exp(jnp.minimum(dA_cs_last - dA_cumsum, 0.0)) * dt
+
+    # Handle seq_idx: zero scale where seq_idx[k] != seq_idx[chunk_end].
+    # Matches Triton: scale = where((seq_idx_last >= 0) & (seq_idx_k == seq_idx_last), scale, 0)
+    if seq_idx is not None:
+        # seq_idx at last valid position of each chunk
+        chunk_ends = jnp.minimum(
+            jnp.arange(1, nchunks + 1) * chunk_size, seqlen
+        ) - 1  # (nchunks,)
+        seq_idx_last = seq_idx[:, chunk_ends]  # (batch, nchunks)
+        # Reshape seq_idx to (batch, nchunks, chunk_size)
+        seq_idx_chunked = seq_idx.reshape(batch, nchunks, chunk_size)
+        # Mask: True where position belongs to same sequence as chunk end
+        same_seq = (seq_idx_last[:, :, None] >= 0) & (
+            seq_idx_chunked == seq_idx_last[:, :, None]
+        )  # (batch, nchunks, chunk_size)
+        # scale is (batch, nheads, nchunks, chunk_size)
+        # same_seq is (batch, nchunks, chunk_size) → broadcast over nheads
+        scale = jnp.where(same_seq[:, None, :, :], scale, 0.0)
 
     # Reshape x → (BCH, headdim, chunk_size), fold scale into x
     x = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
@@ -340,6 +373,7 @@ def chunk_state_fwd_mosaic(
     B,          # (batch, seqlen, ngroups, dstate)            float32
     dt,         # (batch, nheads, nchunks, chunk_size)        float32
     dA_cumsum,  # (batch, nheads, nchunks, chunk_size)        float32
+    seq_idx=None,  # (batch, seqlen)                          int32, optional
     BM: int = 64,
     BK: int = 64,
     BN: int = 64,
@@ -354,6 +388,10 @@ def chunk_state_fwd_mosaic(
     B          : (batch, seqlen, ngroups, dstate)   float32
     dt         : (batch, nheads, nchunks, chunk_size) float32  (post-processed)
     dA_cumsum  : (batch, nheads, nchunks, chunk_size) float32
+    seq_idx    : (batch, seqlen) int32, optional
+        Sequence index per position for packed variable-length sequences.
+        Positions where seq_idx differs from the chunk's last position
+        have their contribution zeroed (scale = 0).
     BM, BK, BN : tile sizes (default 64).  chunk_size must be divisible by BK.
     num_stages : TMA pipeline depth (default 2)
 
@@ -364,7 +402,7 @@ def chunk_state_fwd_mosaic(
     Same semantics as the Triton reference _chunk_state_fwd.
     """
     x_flat, B_flat, meta = chunk_state_preprocess(
-        x, B, dt, dA_cumsum, BM=BM, BK=BK, BN=BN,
+        x, B, dt, dA_cumsum, seq_idx=seq_idx, BM=BM, BK=BK, BN=BN,
     )
     return chunk_state_kernel_only(
         x_flat, B_flat,
@@ -386,6 +424,7 @@ def chunk_state_fwd(
     B,
     dt,
     dA_cumsum,
+    seq_idx=None,
     BM: int = 64,
     BK: int = 64,
     BN: int = 64,
@@ -394,6 +433,7 @@ def chunk_state_fwd(
     """Drop-in replacement for mamba_ssm._chunk_state_fwd (JAX/Pallas version)."""
     return chunk_state_fwd_mosaic(
         x, B, dt, dA_cumsum,
+        seq_idx=seq_idx,
         BM=BM, BK=BK, BN=BN,
         num_stages=num_stages,
     )

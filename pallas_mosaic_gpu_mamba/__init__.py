@@ -5,10 +5,19 @@ for Mamba2 SSM operations.
 
 from .chunk_cumsum_fwd import chunk_cumsum_fwd, chunk_cumsum_fwd_mosaic
 from .chunk_state_fwd import chunk_state_fwd, chunk_state_fwd_mosaic
+from .state_passing_fwd import state_passing_fwd, state_passing_fwd_mosaic
+from .bmm_chunk_fwd import bmm_chunk_fwd, bmm_chunk_fwd_mosaic
+from .chunk_scan_fwd import chunk_scan_fwd, chunk_scan_fwd_mosaic
 
 __all__ = [
     "chunk_cumsum_fwd",
     "chunk_cumsum_fwd_mosaic",
     "chunk_state_fwd",
     "chunk_state_fwd_mosaic",
+    "state_passing_fwd",
+    "state_passing_fwd_mosaic",
+    "bmm_chunk_fwd",
+    "bmm_chunk_fwd_mosaic",
+    "chunk_scan_fwd",
+    "chunk_scan_fwd_mosaic",
 ]
