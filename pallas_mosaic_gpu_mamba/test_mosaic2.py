@@ -73,6 +73,20 @@ def check(name, jax_arr, ref_arr, atol=1e-3):
     return d < atol
 
 
+def _bench_fn(fn, warmup=10, rep=50):
+    """Benchmark a callable, using triton do_bench if available, else manual timing."""
+    if _HAS_TRITON:
+        from triton.testing import do_bench
+        return do_bench(fn, warmup=warmup, rep=rep)
+    else:
+        times = []
+        for _ in range(warmup + rep):
+            t0 = time.perf_counter()
+            fn()
+            times.append(time.perf_counter() - t0)
+        return float(np.median(times[warmup:])) * 1e3
+
+
 # ===========================================================================
 # state_passing_fwd — naive JAX reference
 # ===========================================================================
@@ -229,8 +243,9 @@ def benchmark_state_passing(
     batch=2, nchunks=8, nheads=64, dim=4096,
     use_initstates=True,
     warmup=25, rep=200,
+    amortize_N=50,
 ):
-    """Benchmark state_passing_fwd_mosaic vs naive and Triton."""
+    """Benchmark state_passing_fwd_mosaic vs naive and Triton (dispatch-free)."""
     print(f"\n── [state_passing_fwd] benchmark  "
           f"B={batch} C={nchunks} H={nheads} D={dim} "
           f"init={use_initstates} ──")
@@ -241,39 +256,47 @@ def benchmark_state_passing(
     dA_cs_j = -jax.random.uniform(k2, (batch, nheads, nchunks)) * 0.5
     init_j = jax.random.normal(k3, (batch, nheads, dim)) * 0.1 if use_initstates else None
 
-    fn_naive = jax.jit(lambda s, d, i: _naive_state_passing_fwd(s, d, i))
-    jax.block_until_ready(fn_naive(states_j, dA_cs_j, init_j))
+    # ── Naive JAX (amortized) ──
+    # Use lax.cond with acc-dependent predicate to prevent XLA loop hoisting.
+    # Multiplicative perturbation fails because state_passing is affine in states.
+    naive_sample = _naive_state_passing_fwd(states_j, dA_cs_j, init_j)
+    naive_dummy = jax.tree.map(jnp.zeros_like, naive_sample)
 
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_naive = do_bench(
-            lambda: jax.block_until_ready(fn_naive(states_j, dA_cs_j, init_j)),
-            warmup=warmup, rep=rep,
-        )
-    else:
-        times_naive = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_naive(states_j, dA_cs_j, init_j))
-            times_naive.append(time.perf_counter() - t0)
-        ms_naive = float(np.median(times_naive[warmup:])) * 1e3
+    @jax.jit
+    def naive_looped(s, d, i):
+        def body(idx, acc):
+            out, final = jax.lax.cond(
+                acc > -1e30,
+                lambda: _naive_state_passing_fwd(s, d, i),
+                lambda: naive_dummy,
+            )
+            return acc + out[0, 0, 0, 0]
+        return jax.lax.fori_loop(0, amortize_N, body, 0.0)
 
-    fn_mosaic = jax.jit(lambda s, d, i: state_passing_fwd_mosaic(s, d, initial_states=i))
-    jax.block_until_ready(fn_mosaic(states_j, dA_cs_j, init_j))
+    jax.block_until_ready(naive_looped(states_j, dA_cs_j, init_j))
+    ms_naive = _bench_fn(
+        lambda: jax.block_until_ready(naive_looped(states_j, dA_cs_j, init_j)),
+    ) / amortize_N
 
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_mosaic = do_bench(
-            lambda: jax.block_until_ready(fn_mosaic(states_j, dA_cs_j, init_j)),
-            warmup=warmup, rep=rep,
-        )
-    else:
-        times_mosaic = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_mosaic(states_j, dA_cs_j, init_j))
-            times_mosaic.append(time.perf_counter() - t0)
-        ms_mosaic = float(np.median(times_mosaic[warmup:])) * 1e3
+    # ── Mosaic GPU (amortized) ──
+    mosaic_sample = state_passing_fwd_mosaic(states_j, dA_cs_j, initial_states=init_j)
+    mosaic_dummy = jax.tree.map(jnp.zeros_like, mosaic_sample)
+
+    @jax.jit
+    def mosaic_looped(s, d, i):
+        def body(idx, acc):
+            out, final = jax.lax.cond(
+                acc > -1e30,
+                lambda: state_passing_fwd_mosaic(s, d, initial_states=i),
+                lambda: mosaic_dummy,
+            )
+            return acc + out[0, 0, 0, 0]
+        return jax.lax.fori_loop(0, amortize_N, body, 0.0)
+
+    jax.block_until_ready(mosaic_looped(states_j, dA_cs_j, init_j))
+    ms_mosaic = _bench_fn(
+        lambda: jax.block_until_ready(mosaic_looped(states_j, dA_cs_j, init_j)),
+    ) / amortize_N
 
     bytes_io = (
         batch * nchunks * nheads * dim * 4
@@ -285,12 +308,11 @@ def benchmark_state_passing(
     gbps_naive = bytes_io / (ms_naive * 1e-3) / 1e9
     gbps_mosaic = bytes_io / (ms_mosaic * 1e-3) / 1e9
 
-    print(f"  Naive JAX  : {ms_naive:.3f} ms   {gbps_naive:.1f} GB/s")
-    print(f"  Mosaic GPU : {ms_mosaic:.3f} ms   {gbps_mosaic:.1f} GB/s")
+    print(f"  Naive JAX  (N={amortize_N}): {ms_naive:.4f} ms   {gbps_naive:.1f} GB/s")
+    print(f"  Mosaic GPU (N={amortize_N}): {ms_mosaic:.4f} ms   {gbps_mosaic:.1f} GB/s")
 
     if _HAS_TRITON:
         import torch
-        from triton.testing import do_bench
         states_t = _to_torch(states_j)
         dA_cs_t = _to_torch(dA_cs_j)
         init_t = _to_torch(init_j) if init_j is not None else None
@@ -299,11 +321,11 @@ def benchmark_state_passing(
             _triton_state_passing_fwd(states_t, dA_cs_t, initial_states=init_t)
             torch.cuda.synchronize()
 
-        ms_triton = do_bench(_triton_fn, warmup=warmup, rep=rep)
+        ms_triton = _bench_fn(_triton_fn, warmup=warmup, rep=rep)
         gbps_triton = bytes_io / (ms_triton * 1e-3) / 1e9
-        print(f"  Triton     : {ms_triton:.3f} ms   {gbps_triton:.1f} GB/s")
+        print(f"  Triton            : {ms_triton:.4f} ms   {gbps_triton:.1f} GB/s")
 
-    print(f"  ── Ratios ──")
+    print(f"  ── Ratios (dispatch-free) ──")
     print(f"  Mosaic / Naive : {ms_mosaic/ms_naive:.2f}x")
     if _HAS_TRITON:
         print(f"  Mosaic / Triton: {ms_mosaic/ms_triton:.2f}x")
@@ -462,8 +484,9 @@ def benchmark_bmm_chunk(
     batch=2, seqlen=2048, ngroups=1, k=64, chunk_size=256,
     BM=64, BK=64, BN=64,
     warmup=25, rep=200,
+    amortize_N=50,
 ):
-    """Benchmark bmm_chunk_fwd_mosaic vs naive and Triton."""
+    """Benchmark bmm_chunk_fwd_mosaic vs naive and Triton (dispatch-free)."""
     nchunks = math.ceil(seqlen / chunk_size)
     print(f"\n── [bmm_chunk_fwd] benchmark  "
           f"B={batch} L={seqlen} G={ngroups} K={k} Q={chunk_size} ──")
@@ -473,96 +496,92 @@ def benchmark_bmm_chunk(
     a_j = jax.random.normal(k1, (batch, seqlen, ngroups, k)) * 0.1
     b_j = jax.random.normal(k2, (batch, seqlen, ngroups, k)) * 0.1
 
-    # --- Naive JAX (matmul) ---
-    fn_naive = jax.jit(lambda a, b: _naive_bmm_chunk_fwd(a, b, chunk_size))
-    jax.block_until_ready(fn_naive(a_j, b_j))
+    # Bytes IO
+    bytes_io = (
+        batch * seqlen * ngroups * k * 4 * 2          # a + b in
+        + batch * nchunks * ngroups * chunk_size * chunk_size * 4  # out
+    )
 
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_naive = do_bench(
-            lambda: jax.block_until_ready(fn_naive(a_j, b_j)),
-            warmup=warmup, rep=rep,
-        )
-    else:
-        times_naive = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_naive(a_j, b_j))
-            times_naive.append(time.perf_counter() - t0)
-        ms_naive = float(np.median(times_naive[warmup:])) * 1e3
+    # ── Naive JAX (amortized) ──
+    # Use lax.cond with acc-dependent predicate to prevent XLA loop hoisting.
+    naive_bmm_sample = _naive_bmm_chunk_fwd(a_j, b_j, chunk_size)
+    naive_bmm_dummy = jax.tree.map(jnp.zeros_like, naive_bmm_sample)
 
-    # --- Mosaic GPU end-to-end ---
-    fn_mosaic = jax.jit(lambda a, b: bmm_chunk_fwd_mosaic(
-        a, b, chunk_size, BM=BM, BK=BK, BN=BN,
-    ))
-    jax.block_until_ready(fn_mosaic(a_j, b_j))
+    @jax.jit
+    def naive_looped(a, b):
+        def body(i, acc):
+            out = jax.lax.cond(
+                acc > -1e30,
+                lambda: _naive_bmm_chunk_fwd(a, b, chunk_size),
+                lambda: naive_bmm_dummy,
+            )
+            return acc + out[0, 0, 0, 0, 0]
+        return jax.lax.fori_loop(0, amortize_N, body, 0.0)
 
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_mosaic = do_bench(
-            lambda: jax.block_until_ready(fn_mosaic(a_j, b_j)),
-            warmup=warmup, rep=rep,
-        )
-    else:
-        times_mosaic = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_mosaic(a_j, b_j))
-            times_mosaic.append(time.perf_counter() - t0)
-        ms_mosaic = float(np.median(times_mosaic[warmup:])) * 1e3
+    jax.block_until_ready(naive_looped(a_j, b_j))
+    ms_naive = _bench_fn(
+        lambda: jax.block_until_ready(naive_looped(a_j, b_j)),
+    ) / amortize_N
 
-    # --- Mosaic GPU kernel-only ---
+    # ── Mosaic end-to-end (amortized) ──
+    mosaic_bmm_sample = bmm_chunk_fwd_mosaic(a_j, b_j, chunk_size, BM=BM, BK=BK, BN=BN)
+    mosaic_bmm_dummy = jax.tree.map(jnp.zeros_like, mosaic_bmm_sample)
+
+    @jax.jit
+    def mosaic_looped(a, b):
+        def body(i, acc):
+            out = jax.lax.cond(
+                acc > -1e30,
+                lambda: bmm_chunk_fwd_mosaic(a, b, chunk_size, BM=BM, BK=BK, BN=BN),
+                lambda: mosaic_bmm_dummy,
+            )
+            return acc + out[0, 0, 0, 0, 0]
+        return jax.lax.fori_loop(0, amortize_N, body, 0.0)
+
+    jax.block_until_ready(mosaic_looped(a_j, b_j))
+    ms_mosaic = _bench_fn(
+        lambda: jax.block_until_ready(mosaic_looped(a_j, b_j)),
+    ) / amortize_N
+
+    # ── Mosaic kernel-only (amortized) ──
     a_flat, b_T_flat, meta = bmm_chunk_preprocess(
         a_j, b_j, chunk_size, BM=BM, BK=BK, BN=BN,
     )
     jax.block_until_ready((a_flat, b_T_flat))
 
-    fn_kern = jax.jit(lambda af, bf: bmm_chunk_kernel_only(
-        af, bf,
+    kern_kwargs = dict(
         BM=BM, BK=meta['BK'], BN=BN,
         BCG=meta['BCG'], chunk_size=meta['chunk_size'],
         chunk_size_padded=meta['chunk_size_padded'],
         k=meta['k'], k_padded=meta['k_padded'],
         batch=meta['batch'], nchunks=meta['nchunks'],
         ngroups=meta['ngroups'],
-    ))
-    jax.block_until_ready(fn_kern(a_flat, b_T_flat))
-
-    if _HAS_TRITON:
-        ms_kern = do_bench(
-            lambda: jax.block_until_ready(fn_kern(a_flat, b_T_flat)),
-            warmup=warmup, rep=rep,
-        )
-    else:
-        times_kern = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_kern(a_flat, b_T_flat))
-            times_kern.append(time.perf_counter() - t0)
-        ms_kern = float(np.median(times_kern[warmup:])) * 1e3
-
-    # Bytes IO
-    bytes_io = (
-        batch * seqlen * ngroups * k * 4 * 2          # a + b in
-        + batch * nchunks * ngroups * chunk_size * chunk_size * 4  # out
-    )
-    bytes_kern = (
-        meta['BCG'] * meta['chunk_size_padded'] * meta['k_padded'] * 2 * 2  # a + b_T bf16
-        + batch * nchunks * ngroups * chunk_size * chunk_size * 4            # out f32
     )
 
-    gbps_naive = bytes_io / (ms_naive * 1e-3) / 1e9
+    # kernel_only uses pallas_call (opaque to XLA), no perturbation needed
+    @jax.jit
+    def kern_looped(af, bf):
+        def body(i, acc):
+            out = bmm_chunk_kernel_only(af, bf, **kern_kwargs)
+            return acc + out[0, 0, 0, 0, 0]
+        return jax.lax.fori_loop(0, amortize_N, body, 0.0)
+
+    jax.block_until_ready(kern_looped(a_flat, b_T_flat))
+    ms_kern = _bench_fn(
+        lambda: jax.block_until_ready(kern_looped(a_flat, b_T_flat)),
+    ) / amortize_N
+
+    gbps_naive  = bytes_io / (ms_naive  * 1e-3) / 1e9
     gbps_mosaic = bytes_io / (ms_mosaic * 1e-3) / 1e9
-    gbps_kern = bytes_kern / (ms_kern * 1e-3) / 1e9
+    gbps_kern   = bytes_io / (ms_kern   * 1e-3) / 1e9
 
-    print(f"  Naive JAX (matmul) : {ms_naive:.3f} ms   {gbps_naive:.1f} GB/s")
-    print(f"  Mosaic end-to-end  : {ms_mosaic:.3f} ms   {gbps_mosaic:.1f} GB/s")
-    print(f"  Mosaic kernel-only : {ms_kern:.3f} ms   {gbps_kern:.1f} GB/s")
-    print(f"  Mosaic preprocess  : {ms_mosaic - ms_kern:.3f} ms  ({(ms_mosaic - ms_kern)/ms_mosaic*100:.0f}% of total)")
+    print(f"  Naive JAX (matmul) (N={amortize_N}): {ms_naive:.4f} ms   {gbps_naive:.1f} GB/s")
+    print(f"  Mosaic end-to-end  (N={amortize_N}): {ms_mosaic:.4f} ms   {gbps_mosaic:.1f} GB/s")
+    print(f"  Mosaic kernel-only (N={amortize_N}): {ms_kern:.4f} ms   {gbps_kern:.1f} GB/s")
+    print(f"  Mosaic preprocess  (e2e - kern)  : {ms_mosaic - ms_kern:.4f} ms")
 
     if _HAS_TRITON:
         import torch
-        from triton.testing import do_bench
         a_t = _to_torch(a_j)
         b_t = _to_torch(b_j)
 
@@ -570,11 +589,11 @@ def benchmark_bmm_chunk(
             _triton_bmm_chunk_fwd(a_t, b_t, chunk_size, output_dtype=torch.float32)
             torch.cuda.synchronize()
 
-        ms_tri = do_bench(_triton_fn, warmup=warmup, rep=rep)
+        ms_tri = _bench_fn(_triton_fn, warmup=warmup, rep=rep)
         gbps_tri = bytes_io / (ms_tri * 1e-3) / 1e9
-        print(f"  Triton             : {ms_tri:.3f} ms   {gbps_tri:.1f} GB/s")
+        print(f"  Triton                    : {ms_tri:.4f} ms   {gbps_tri:.1f} GB/s")
 
-    print(f"  ── Ratios ──")
+    print(f"  ── Ratios (dispatch-free) ──")
     print(f"  Mosaic e2e   / Naive : {ms_mosaic/ms_naive:.2f}x")
     print(f"  Mosaic kernel/ Naive : {ms_kern/ms_naive:.2f}x")
     if _HAS_TRITON:

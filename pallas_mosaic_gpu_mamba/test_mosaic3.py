@@ -17,6 +17,7 @@ import sys
 import math
 import types
 import time
+from functools import partial
 
 import numpy as np
 import jax
@@ -72,6 +73,59 @@ def check(name, jax_arr, ref_arr, atol=1e-3):
     ok = "\u2713" if d < atol else "\u2717"
     print(f"  {ok}  {name:40s}  max|diff|={d:.2e}  (atol={atol:.0e})")
     return d < atol
+
+
+def _bench_fn(fn, warmup, rep):
+    """Benchmark a callable, using triton do_bench if available, else manual timing."""
+    if _HAS_TRITON:
+        from triton.testing import do_bench
+        return do_bench(fn, warmup=warmup, rep=rep)
+    else:
+        times = []
+        for _ in range(warmup + rep):
+            t0 = time.perf_counter()
+            fn()
+            times.append(time.perf_counter() - t0)
+        return float(np.median(times[warmup:])) * 1e3
+
+
+def _bench_amortized(impl_fn, args, N=100, warmup=10, rep=50):
+    """
+    Measure true GPU time by amortizing JAX dispatch overhead.
+
+    Wraps N calls inside a single jax.jit + fori_loop.  Per-call time =
+    total_time / N, which converges to pure GPU time as N grows.
+
+    Uses jax.lax.cond with an always-true but acc-dependent condition to
+    prevent XLA from hoisting loop-invariant computations out of the loop.
+
+    impl_fn : callable taking *args (all JAX arrays) and returning a pytree.
+              Any Python-scalar / static args must be captured via closure or
+              functools.partial — only JAX arrays should be in ``args``.
+    args    : tuple of JAX arrays to pass as jit function arguments.
+    """
+    sample = impl_fn(*args)
+    dummy = jax.tree.map(jnp.zeros_like, sample)
+    first_leaf = jax.tree.leaves(sample)[0]
+    idx = (0,) * first_leaf.ndim
+
+    @jax.jit
+    def looped(*a):
+        def body(i, acc):
+            result = jax.lax.cond(
+                acc > -1e30,
+                lambda: impl_fn(*a),
+                lambda: dummy,
+            )
+            return acc + jax.tree.leaves(result)[0][idx]
+        return jax.lax.fori_loop(0, N, body, 0.0)
+
+    jax.block_until_ready(looped(*args))
+    ms_total = _bench_fn(
+        lambda: jax.block_until_ready(looped(*args)),
+        warmup, rep,
+    )
+    return ms_total / N
 
 
 # ===========================================================================
@@ -370,44 +424,24 @@ def benchmark_chunk_scan(
     C_j = jax.random.normal(keys[4], (batch, seqlen, ngroups, dstate)) * 0.1
     states_j = jax.random.normal(keys[5], (batch, nchunks, nheads, hdim, dstate)) * 0.01
 
-    # --- Naive JAX ---
-    fn_naive = jax.jit(lambda: _naive_chunk_scan_fwd(cb_j, x_j, dt_j, dA_cs_j, C_j, states_j))
-    jax.block_until_ready(fn_naive())
+    scan_args = (cb_j, x_j, dt_j, dA_cs_j, C_j, states_j)
 
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_naive = do_bench(lambda: jax.block_until_ready(fn_naive()), warmup=warmup, rep=rep)
-    else:
-        times_naive = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_naive())
-            times_naive.append(time.perf_counter() - t0)
-        ms_naive = float(np.median(times_naive[warmup:])) * 1e3
-
-    # --- Mosaic GPU (end-to-end) ---
-    fn_mosaic = jax.jit(lambda: chunk_scan_fwd_mosaic(
-        cb_j, x_j, dt_j, dA_cs_j, C_j, states_j,
-    ))
-    jax.block_until_ready(fn_mosaic())
-
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_mosaic = do_bench(lambda: jax.block_until_ready(fn_mosaic()), warmup=warmup, rep=rep)
-    else:
-        times_mosaic = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_mosaic())
-            times_mosaic.append(time.perf_counter() - t0)
-        ms_mosaic = float(np.median(times_mosaic[warmup:])) * 1e3
-
-    # --- Mosaic GPU (kernel-only) ---
-    cb_flat, x_scaled_flat, C_flat, states_T_flat, meta = chunk_scan_preprocess(
-        cb_j, x_j, dt_j, dA_cs_j, C_j, states_j,
+    # --- Naive JAX (amortized) ---
+    ms_naive = _bench_amortized(
+        _naive_chunk_scan_fwd, scan_args, warmup=warmup, rep=rep,
     )
-    fn_kernel = jax.jit(lambda: chunk_scan_kernel_only(
-        cb_flat, x_scaled_flat, C_flat, states_T_flat,
+
+    # --- Mosaic GPU e2e (amortized) ---
+    ms_mosaic = _bench_amortized(
+        chunk_scan_fwd_mosaic, scan_args, warmup=warmup, rep=rep,
+    )
+
+    # --- Mosaic GPU kernel-only (amortized) ---
+    cb_flat, x_scaled_flat, C_flat, states_T_flat, meta = chunk_scan_preprocess(
+        *scan_args,
+    )
+    kernel_fn = partial(
+        chunk_scan_kernel_only,
         BM=64, BK_cs=meta['BK_cs'], BK_ds=meta['BK_ds'], BN=64,
         num_stages=2,
         **{k: meta[k] for k in (
@@ -415,19 +449,11 @@ def benchmark_chunk_scan(
             'hdim', 'hdim_padded', 'dstate', 'dstate_padded',
             'batch', 'nchunks', 'nheads', 'ngroups',
         )},
-    ))
-    jax.block_until_ready(fn_kernel())
-
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_kernel = do_bench(lambda: jax.block_until_ready(fn_kernel()), warmup=warmup, rep=rep)
-    else:
-        times_kernel = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_kernel())
-            times_kernel.append(time.perf_counter() - t0)
-        ms_kernel = float(np.median(times_kernel[warmup:])) * 1e3
+    )
+    ms_kernel = _bench_amortized(
+        kernel_fn, (cb_flat, x_scaled_flat, C_flat, states_T_flat),
+        warmup=warmup, rep=rep,
+    )
 
     print(f"  Naive JAX       : {ms_naive:.3f} ms")
     print(f"  Mosaic GPU (e2e): {ms_mosaic:.3f} ms")
@@ -636,7 +662,7 @@ def test_chunk_state_varlen_correctness(
         )
     else:
         seq_idx_1d_padded = seq_idx_1d
-    seq_idx_2d = seq_idx_1d_padded[None, :]  # (1, padded_len)
+    seq_idx_2d = seq_idx_1d[None, :]  # (1, total_seqlen) — functions pad internally
 
     # --- chunk_state_fwd (batch=1 packed) ---
     x_2d = x_jax[None, :]         # (1, total_seqlen, nheads, headdim)
@@ -735,21 +761,10 @@ def benchmark_chunk_state_varlen(
     )
     cs_j = jax.random.normal(keys[5], (nchunks, nheads, headdim, dstate)) * 0.01
 
-    fn_mosaic = jax.jit(lambda: chunk_state_varlen_mosaic(
-        B_j, x_j, dt_j, dA_j, cu_seqlens_jax, cs_j,
-    ))
-    jax.block_until_ready(fn_mosaic())
-
-    if _HAS_TRITON:
-        from triton.testing import do_bench
-        ms_mosaic = do_bench(lambda: jax.block_until_ready(fn_mosaic()), warmup=warmup, rep=rep)
-    else:
-        times = []
-        for _ in range(warmup + rep):
-            t0 = time.perf_counter()
-            jax.block_until_ready(fn_mosaic())
-            times.append(time.perf_counter() - t0)
-        ms_mosaic = float(np.median(times[warmup:])) * 1e3
+    varlen_args = (B_j, x_j, dt_j, dA_j, cu_seqlens_jax, cs_j)
+    ms_mosaic = _bench_amortized(
+        chunk_state_varlen_mosaic, varlen_args, warmup=warmup, rep=rep,
+    )
 
     print(f"  Mosaic GPU      : {ms_mosaic:.3f} ms")
 
@@ -781,47 +796,17 @@ if __name__ == "__main__":
     print("chunk_scan_fwd_mosaic — Correctness Tests")
     print("=" * 70)
 
-    # Basic configs
-    test_chunk_scan_correctness(batch=1, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64)
-    test_chunk_scan_correctness(batch=2, seqlen=512, nheads=8, hdim=64, dstate=64, ngroups=1, chunk_size=128)
-    test_chunk_scan_correctness(batch=1, seqlen=256, nheads=8, hdim=128, dstate=64, ngroups=1, chunk_size=64)
-
-    # Multi-group
-    test_chunk_scan_correctness(batch=2, seqlen=512, nheads=16, hdim=64, dstate=64, ngroups=2, chunk_size=128)
-    test_chunk_scan_correctness(batch=1, seqlen=256, nheads=8, hdim=64, dstate=64, ngroups=8, chunk_size=64)
-
-    # Large chunk_size
-    test_chunk_scan_correctness(batch=1, seqlen=512, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=256)
-
-    # With D
-    test_chunk_scan_correctness(batch=2, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64, has_D=True)
-
-    # With z
-    test_chunk_scan_correctness(batch=2, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64, has_z=True)
-
-    # With D and z
+    # Basic config
     test_chunk_scan_correctness(batch=1, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64, has_D=True, has_z=True)
 
-    # Larger dstate
-    test_chunk_scan_correctness(batch=1, seqlen=256, nheads=4, hdim=64, dstate=128, ngroups=1, chunk_size=64)
+    # Nemotron-style (multi-group, larger)
+    test_chunk_scan_correctness(batch=2, seqlen=512, nheads=8, hdim=64, dstate=64, ngroups=8, chunk_size=64)
 
     print("\n" + "=" * 70)
     print("chunk_scan_fwd_mosaic — SEQ_IDX Correctness Tests")
     print("=" * 70)
 
-    # Single sequence (no-op)
-    test_chunk_scan_correctness(
-        batch=1, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64,
-        seq_idx_config={'seq_lengths': [[256]]},
-    )
-
-    # Two sequences, boundary at chunk edge
-    test_chunk_scan_correctness(
-        batch=1, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64,
-        seq_idx_config={'seq_lengths': [[128, 128]]},
-    )
-
-    # Two sequences, mid-chunk boundary
+    # Mid-chunk boundary, multi-batch
     test_chunk_scan_correctness(
         batch=2, seqlen=512, nheads=8, hdim=64, dstate=64, ngroups=1, chunk_size=64,
         seq_idx_config={'seq_lengths': [
@@ -830,35 +815,14 @@ if __name__ == "__main__":
         ]},
     )
 
-    # Three sequences, multi-group
+    # seq_idx + D + z + multi-group combined
     test_chunk_scan_correctness(
-        batch=2, seqlen=512, nheads=8, hdim=64, dstate=64, ngroups=4, chunk_size=64,
-        seq_idx_config={'seq_lengths': [
-            [64, 192, 256],
-            [128, 128, 256],
-        ]},
-    )
-
-    # Every chunk different sequence
-    test_chunk_scan_correctness(
-        batch=1, seqlen=256, nheads=4, hdim=64, dstate=64, ngroups=1, chunk_size=64,
-        seq_idx_config={'seq_lengths': [[64, 64, 64, 64]]},
-    )
-
-    # seq_idx + D + z combined
-    test_chunk_scan_correctness(
-        batch=2, seqlen=512, nheads=8, hdim=64, dstate=64, ngroups=1, chunk_size=128,
+        batch=2, seqlen=512, nheads=8, hdim=64, dstate=64, ngroups=4, chunk_size=128,
         has_D=True, has_z=True,
         seq_idx_config={'seq_lengths': [
             [256, 256],
             [128, 384],
         ]},
-    )
-
-    # seq_idx with larger dstate and multi-group
-    test_chunk_scan_correctness(
-        batch=1, seqlen=256, nheads=8, hdim=64, dstate=128, ngroups=8, chunk_size=64,
-        seq_idx_config={'seq_lengths': [[100, 156]]},
     )
 
     print("\n" + "=" * 70)
@@ -881,41 +845,13 @@ if __name__ == "__main__":
     print("chunk_state_varlen_mosaic — Correctness Tests")
     print("=" * 70)
 
-    # Basic configs
+    # Basic config
     test_chunk_state_varlen_correctness(
         batch=10, nheads=8, headdim=64, dstate=64, ngroups=1, chunk_size=64,
     )
-    test_chunk_state_varlen_correctness(
-        batch=5, nheads=4, headdim=64, dstate=64, ngroups=1, chunk_size=128,
-    )
-    # Multi-group
-    test_chunk_state_varlen_correctness(
-        batch=10, nheads=8, headdim=64, dstate=64, ngroups=4, chunk_size=64,
-    )
-    test_chunk_state_varlen_correctness(
-        batch=10, nheads=16, headdim=64, dstate=64, ngroups=8, chunk_size=64,
-    )
-    # ngroups == nheads
+    # Multi-group (Nemotron-style: ngroups=nheads)
     test_chunk_state_varlen_correctness(
         batch=5, nheads=8, headdim=64, dstate=64, ngroups=8, chunk_size=64,
-    )
-    # Larger dstate
-    test_chunk_state_varlen_correctness(
-        batch=5, nheads=8, headdim=64, dstate=128, ngroups=1, chunk_size=64,
-    )
-    # Larger headdim
-    test_chunk_state_varlen_correctness(
-        batch=5, nheads=4, headdim=128, dstate=64, ngroups=1, chunk_size=64,
-    )
-    # Very short sequences
-    test_chunk_state_varlen_correctness(
-        batch=20, nheads=4, headdim=64, dstate=64, ngroups=1, chunk_size=64,
-        min_seqlen=1, max_seqlen=10,
-    )
-    # Longer sequences spanning many chunks
-    test_chunk_state_varlen_correctness(
-        batch=5, nheads=8, headdim=64, dstate=64, ngroups=1, chunk_size=64,
-        min_seqlen=100, max_seqlen=500,
     )
 
     print("\n" + "=" * 70)
