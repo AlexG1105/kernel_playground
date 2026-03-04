@@ -437,3 +437,159 @@ def chunk_state_fwd(
         BM=BM, BK=BK, BN=BN,
         num_stages=num_stages,
     )
+
+
+# ===========================================================================
+# chunk_state_varlen — variable-length final-state computation
+# ===========================================================================
+
+def chunk_state_varlen_mosaic(
+    B,              # (total_seqlen, ngroups, dstate)       float32
+    x,              # (total_seqlen, nheads, headdim)       float32
+    dt,             # (nheads, nchunks, chunk_size)         float32
+    dA_cumsum,      # (nheads, nchunks, chunk_size)         float32
+    cu_seqlens,     # (batch + 1,)                          int32
+    chunk_states,   # (nchunks, nheads, headdim, dstate)    float32
+    BM: int = 64,
+    BK: int = 64,
+    BN: int = 64,
+    num_stages: int = 2,
+) -> jnp.ndarray:
+    """
+    H100/H200 Pallas Mosaic GPU port of chunk_state_varlen.
+
+    Computes the final SSM state for each variable-length sequence in a
+    batch of concatenated (packed) sequences.
+
+    For each sequence b (defined by cu_seqlens[b]:cu_seqlens[b+1]):
+      1. Find the last chunk containing this sequence's end
+      2. Compute x_T @ diag(scale) @ B for positions in that chunk
+         belonging to this sequence
+      3. Add chunk_states[last_chunk] * exp(dA_cs_last) if the sequence
+         spans earlier chunks
+
+    Input shapes differ from chunk_state_fwd: no batch dimension, all
+    sequences are concatenated along the sequence axis.
+
+    Parameters
+    ----------
+    B            : (total_seqlen, ngroups, dstate) float32
+    x            : (total_seqlen, nheads, headdim) float32
+    dt           : (nheads, nchunks, chunk_size) float32
+    dA_cumsum    : (nheads, nchunks, chunk_size) float32
+    cu_seqlens   : (batch + 1,) int32 — cumulative sequence lengths
+    chunk_states : (nchunks, nheads, headdim, dstate) float32
+        Running states after state_passing_fwd (state at START of each chunk).
+    BM, BK, BN  : tile sizes (default 64)
+    num_stages   : TMA pipeline depth (default 2)
+
+    Returns
+    -------
+    states : (batch, nheads, headdim, dstate) float32
+        Final state for each sequence.
+    """
+    total_seqlen, nheads, headdim = x.shape
+    _, nchunks, chunk_size = dt.shape
+    _, ngroups, dstate = B.shape
+    batch = cu_seqlens.shape[0] - 1
+
+    assert nheads % ngroups == 0
+    assert B.shape == (total_seqlen, ngroups, dstate)
+    assert dt.shape == (nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+    assert chunk_states.shape == (nchunks, nheads, headdim, dstate)
+
+    BK = min(BK, chunk_size)
+    assert chunk_size % BK == 0
+
+    # --- Pad x and B to nchunks * chunk_size ---
+    padded_len = nchunks * chunk_size
+    if total_seqlen < padded_len:
+        pad = padded_len - total_seqlen
+        x = jnp.pad(x, ((0, pad), (0, 0), (0, 0)))
+        B = jnp.pad(B, ((0, pad), (0, 0), (0, 0)))
+
+    # --- Per-sequence indexing ---
+    end_idxs = cu_seqlens[1:]                             # (batch,)
+    start_idxs = cu_seqlens[:-1]                          # (batch,)
+    last_chunks = (end_idxs - 1) // chunk_size            # (batch,)
+    chunk_starts = last_chunks * chunk_size               # (batch,)
+    chunk_size_limits = end_idxs - chunk_starts           # (batch,)
+    start_in_chunks = jnp.maximum(start_idxs - chunk_starts, 0)  # (batch,)
+
+    # --- Gather last-chunk data per sequence ---
+    # x, B: use advanced indexing with (batch, chunk_size) offsets
+    offsets = chunk_starts[:, None] + jnp.arange(chunk_size)[None, :]  # (batch, chunk_size)
+    x_last = x[offsets]       # (batch, chunk_size, nheads, headdim)
+    B_last = B[offsets]       # (batch, chunk_size, ngroups, dstate)
+
+    # dt, dA_cumsum: index by last_chunks
+    dt_last = dt[:, last_chunks, :].transpose(1, 0, 2)        # (batch, nheads, chunk_size)
+    dA_last = dA_cumsum[:, last_chunks, :].transpose(1, 0, 2)  # (batch, nheads, chunk_size)
+
+    # dA_cs_last: dA_cumsum at the last valid position per sequence
+    cs_lim_idx = jnp.broadcast_to(
+        (chunk_size_limits - 1)[:, None, None], (batch, nheads, 1)
+    )
+    dA_cs_last = jnp.take_along_axis(dA_last, cs_lim_idx, axis=2)[:, :, 0]
+    # (batch, nheads)
+
+    # --- Compute scale with valid-position masking ---
+    scale = jnp.exp(jnp.minimum(dA_cs_last[:, :, None] - dA_last, 0.0)) * dt_last
+    # (batch, nheads, chunk_size)
+
+    positions = jnp.arange(chunk_size)
+    valid_mask = (
+        (positions[None, :] >= start_in_chunks[:, None])
+        & (positions[None, :] < chunk_size_limits[:, None])
+    )  # (batch, chunk_size)
+    scale = jnp.where(valid_mask[:, None, :], scale, 0.0)
+
+    # --- Fold scale into x, prepare for WGMMA ---
+    # x_last: (batch, chunk_size, nheads, headdim) → x_T: (batch, nheads, headdim, chunk_size)
+    x_T = x_last.transpose(0, 2, 3, 1)
+    x_scaled_T = x_T * scale[:, :, None, :]  # (batch, nheads, headdim, chunk_size)
+
+    BCH = batch * nheads
+    BCG = batch * ngroups
+    x_flat = x_scaled_T.reshape(BCH, headdim, chunk_size)
+
+    # B_last: (batch, chunk_size, ngroups, dstate) → (BCG, chunk_size, dstate)
+    B_flat = B_last.transpose(0, 2, 1, 3).reshape(BCG, chunk_size, dstate)
+
+    # --- Pad and cast to bf16 ---
+    headdim_padded = math.ceil(headdim / BM) * BM
+    dstate_padded = math.ceil(dstate / BN) * BN
+
+    if headdim_padded > headdim:
+        x_flat = jnp.pad(x_flat, ((0, 0), (0, headdim_padded - headdim), (0, 0)))
+    if dstate_padded > dstate:
+        B_flat = jnp.pad(B_flat, ((0, 0), (0, 0), (0, dstate_padded - dstate)))
+
+    x_flat = x_flat.astype(jnp.bfloat16)
+    B_flat = B_flat.astype(jnp.bfloat16)
+
+    # --- Run WGMMA kernel (reuse chunk_state_kernel_only with nchunks=1) ---
+    states_raw = chunk_state_kernel_only(
+        x_flat, B_flat,
+        BCH=BCH, BCG=BCG,
+        headdim=headdim, headdim_padded=headdim_padded,
+        dstate=dstate, dstate_padded=dstate_padded,
+        batch=batch, nchunks=1, nheads=nheads, ngroups=ngroups,
+        chunk_size=chunk_size,
+        BM=BM, BK=BK, BN=BN, num_stages=num_stages,
+    )
+    # states_raw: (batch, 1, nheads, headdim, dstate)
+    states_raw = states_raw[:, 0]  # (batch, nheads, headdim, dstate)
+
+    # --- Add chunk_states contribution ---
+    # Only if the sequence spans earlier chunks (start_idx < chunk_start)
+    cs_last = chunk_states[last_chunks]  # (batch, nheads, headdim, dstate)
+    has_prev = start_idxs < chunk_starts  # (batch,)
+    cs_scale = jnp.exp(dA_cs_last)       # (batch, nheads)
+    cs_contrib = cs_last * cs_scale[:, :, None, None]
+    states = states_raw + jnp.where(
+        has_prev[:, None, None, None], cs_contrib, 0.0
+    )
+
+    return states

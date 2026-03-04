@@ -3,6 +3,7 @@ test_mosaic3.py
 
 Correctness checks and benchmarks for:
   - chunk_scan_fwd_mosaic
+  - chunk_state_varlen_mosaic
 
 Run on H100/H200 (Hopper) with the Mosaic GPU Pallas backend:
   python test_mosaic3.py
@@ -29,6 +30,12 @@ from pallas_mosaic_gpu_mamba.chunk_scan_fwd import (
     chunk_scan_fwd_mosaic,
     chunk_scan_preprocess,
     chunk_scan_kernel_only,
+)
+from pallas_mosaic_gpu_mamba.chunk_state_fwd import (
+    chunk_state_varlen_mosaic,
+    chunk_state_fwd_mosaic,
+    chunk_state_kernel_only,
+    chunk_state_preprocess,
 )
 
 # ---------------------------------------------------------------------------
@@ -453,6 +460,319 @@ def benchmark_chunk_scan(
 
 
 # ===========================================================================
+# chunk_state_varlen — Triton reference (optional)
+# ===========================================================================
+
+_HAS_TRITON_VARLEN = False
+try:
+    from mamba_ssm.ops.triton.ssd_chunk_state import (
+        chunk_state_varlen as _triton_chunk_state_varlen,
+    )
+    _HAS_TRITON_VARLEN = True
+except Exception:
+    pass
+
+
+# ===========================================================================
+# chunk_state_varlen — naive JAX reference
+# ===========================================================================
+
+def _naive_chunk_state_varlen(B, x, dt, dA_cumsum, cu_seqlens, chunk_states):
+    """
+    Naive JAX reference for chunk_state_varlen.
+
+    Computes the final state for each variable-length sequence by:
+    1. For each sequence, find the last chunk
+    2. Compute x_T @ diag(scale) @ B for valid positions in that chunk
+    3. Add chunk_states[last_chunk] * exp(dA_cs_last) for accumulated state
+
+    B            : (total_seqlen, ngroups, dstate)
+    x            : (total_seqlen, nheads, headdim)
+    dt           : (nheads, nchunks, chunk_size)
+    dA_cumsum    : (nheads, nchunks, chunk_size)
+    cu_seqlens   : (batch + 1,) int32
+    chunk_states : (nchunks, nheads, headdim, dstate)
+
+    Returns: (batch, nheads, headdim, dstate)
+    """
+    total_seqlen, nheads, headdim = x.shape
+    _, nchunks, chunk_size = dt.shape
+    _, ngroups, dstate = B.shape
+    batch = cu_seqlens.shape[0] - 1
+    ratio = nheads // ngroups
+
+    results = []
+    for b in range(batch):
+        start = int(cu_seqlens[b])
+        end = int(cu_seqlens[b + 1])
+
+        last_chunk = (end - 1) // chunk_size
+        chunk_start = last_chunk * chunk_size
+        chunk_end_pos = min(end, (last_chunk + 1) * chunk_size)
+        start_in_chunk = max(start - chunk_start, 0)
+
+        # Extract last chunk data
+        x_chunk = jnp.zeros((chunk_size, nheads, headdim))
+        B_chunk = jnp.zeros((chunk_size, ngroups, dstate))
+        valid_len = chunk_end_pos - chunk_start
+        if chunk_start < total_seqlen:
+            actual_len = min(valid_len, total_seqlen - chunk_start)
+            x_chunk = x_chunk.at[:actual_len].set(
+                x[chunk_start:chunk_start + actual_len]
+            )
+            B_chunk = B_chunk.at[:actual_len].set(
+                B[chunk_start:chunk_start + actual_len]
+            )
+
+        # dt and dA_cumsum for this chunk
+        dt_chunk = dt[:, last_chunk, :]         # (nheads, chunk_size)
+        dA_chunk = dA_cumsum[:, last_chunk, :]  # (nheads, chunk_size)
+
+        # dA_cs at last valid position
+        last_valid = end - chunk_start - 1
+        dA_cs_last = dA_chunk[:, last_valid]    # (nheads,)
+
+        # Scale
+        scale = jnp.exp(jnp.minimum(dA_cs_last[:, None] - dA_chunk, 0.0)) * dt_chunk
+        # (nheads, chunk_size)
+
+        # Zero invalid positions
+        positions = jnp.arange(chunk_size)
+        valid = (positions >= start_in_chunk) & (positions < (end - chunk_start))
+        scale = jnp.where(valid[None, :], scale, 0.0)
+
+        # x_T @ diag(scale) @ B per head
+        # x_chunk: (chunk_size, nheads, headdim) → per head: (headdim, chunk_size)
+        # B_chunk: (chunk_size, ngroups, dstate) → per group: (chunk_size, dstate)
+        state_b = jnp.zeros((nheads, headdim, dstate))
+        for h in range(nheads):
+            g = h // ratio
+            x_h = x_chunk[:, h, :]  # (chunk_size, headdim)
+            B_g = B_chunk[:, g, :]  # (chunk_size, dstate)
+            s = scale[h, :]         # (chunk_size,)
+            # x_T @ diag(s) @ B = (headdim, chunk_size) @ diag(s) @ (chunk_size, dstate)
+            x_scaled = x_h * s[:, None]  # (chunk_size, headdim)
+            state_b = state_b.at[h].set(x_scaled.T @ B_g)
+
+        # Add chunk_states contribution
+        if start < chunk_start:
+            cs = chunk_states[last_chunk]  # (nheads, headdim, dstate)
+            cs_scale = jnp.exp(dA_cs_last)[:, None, None]
+            state_b = state_b + cs * cs_scale
+
+        results.append(state_b)
+
+    return jnp.stack(results, axis=0)  # (batch, nheads, headdim, dstate)
+
+
+# ===========================================================================
+# chunk_state_varlen — correctness test
+# ===========================================================================
+
+def test_chunk_state_varlen_correctness(
+    batch=10,
+    nheads=8,
+    headdim=64,
+    dstate=64,
+    ngroups=1,
+    chunk_size=64,
+    min_seqlen=1,
+    max_seqlen=200,
+    atol=2.0,
+):
+    """
+    Correctness test for chunk_state_varlen_mosaic.
+
+    Generates random variable-length sequences, runs the full pipeline
+    (chunk_state_fwd → state_passing → chunk_state_varlen) for the Mosaic
+    implementation, and compares against a naive per-sequence reference.
+    """
+    print(f"\n── [chunk_state_varlen] correctness  "
+          f"B={batch} H={nheads} N={headdim} D={dstate} G={ngroups} "
+          f"Q={chunk_size} seqlens=[{min_seqlen},{max_seqlen}] ──")
+
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 8)
+
+    # Generate random sequence lengths
+    seqlens = jax.random.randint(
+        keys[0], (batch,), minval=min_seqlen, maxval=max_seqlen + 1
+    )
+    seqlens = np.array(seqlens)
+    cu_seqlens = np.concatenate([[0], np.cumsum(seqlens)])
+    total_seqlen = int(cu_seqlens[-1])
+    nchunks = math.ceil(total_seqlen / chunk_size)
+    cu_seqlens_jax = jnp.array(cu_seqlens, dtype=jnp.int32)
+    print(f"  total_seqlen={total_seqlen}, nchunks={nchunks}, "
+          f"seqlens range=[{seqlens.min()},{seqlens.max()}]")
+
+    # Generate random inputs (no batch dim for varlen)
+    B_jax = jax.random.normal(keys[1], (total_seqlen, ngroups, dstate)) * 0.2
+    x_jax = jax.random.normal(keys[2], (total_seqlen, nheads, headdim)) * 0.1
+    A = -0.1 * jax.random.uniform(keys[3], (nheads,))
+
+    # dt: (total_seqlen, nheads) → processed via chunk_cumsum
+    dt_raw = jax.nn.softplus(
+        jax.random.normal(keys[4], (total_seqlen, nheads)) - 4.0
+    )
+
+    # --- Compute dA_cumsum and dt_rounded (simple chunk_cumsum) ---
+    padded_len = nchunks * chunk_size
+    dt_padded = jnp.pad(dt_raw, ((0, padded_len - total_seqlen), (0, 0)))
+    dt_chunked = dt_padded.reshape(nchunks, chunk_size, nheads).transpose(2, 0, 1)
+    # (nheads, nchunks, chunk_size)
+
+    dA = dt_chunked * A[:, None, None]  # (nheads, nchunks, chunk_size)
+    dA_cumsum = jnp.cumsum(dA, axis=-1)  # (nheads, nchunks, chunk_size)
+
+    # --- Build seq_idx for chunk_state_fwd (batch=1 packed) ---
+    seq_idx_list = []
+    for i, s in enumerate(seqlens):
+        seq_idx_list.extend([i] * int(s))
+    seq_idx_1d = jnp.array(seq_idx_list, dtype=jnp.int32)
+    if total_seqlen < padded_len:
+        seq_idx_1d_padded = jnp.pad(
+            seq_idx_1d, (0, padded_len - total_seqlen), constant_values=-1
+        )
+    else:
+        seq_idx_1d_padded = seq_idx_1d
+    seq_idx_2d = seq_idx_1d_padded[None, :]  # (1, padded_len)
+
+    # --- chunk_state_fwd (batch=1 packed) ---
+    x_2d = x_jax[None, :]         # (1, total_seqlen, nheads, headdim)
+    B_2d = B_jax[None, :]         # (1, total_seqlen, ngroups, dstate)
+    dt_2d = dt_chunked[None, :]   # (1, nheads, nchunks, chunk_size)
+    dA_cs_2d = dA_cumsum[None, :] # (1, nheads, nchunks, chunk_size)
+
+    chunk_states_full = chunk_state_fwd_mosaic(
+        x_2d, B_2d, dt_2d, dA_cs_2d, seq_idx=seq_idx_2d,
+    )
+    # (1, nchunks, nheads, headdim, dstate)
+
+    # --- state_passing_fwd (simple cumulative product) ---
+    # For simplicity, use a naive state passing: accumulate states chunk by chunk
+    from pallas_mosaic_gpu_mamba.state_passing_fwd import state_passing_fwd_mosaic
+    dA_last = dA_cumsum[:, :, -1]  # (nheads, nchunks)
+    chunk_states_sq = chunk_states_full.squeeze(0)  # (nchunks, nheads, headdim, dstate)
+    cs_flat = chunk_states_sq.reshape(nchunks, nheads, headdim * dstate)
+    passed_flat, _ = state_passing_fwd_mosaic(
+        cs_flat[None, :],           # (1, nchunks, nheads, headdim*dstate)
+        dA_last[None, :],           # (1, nheads, nchunks)
+        seq_idx=seq_idx_2d,
+        chunk_size=chunk_size,
+    )
+    passed = passed_flat[0].reshape(nchunks, nheads, headdim, dstate)
+    # passed: (nchunks, nheads, headdim, dstate) — state at START of each chunk
+
+    # --- chunk_state_varlen_mosaic ---
+    out_mosaic = chunk_state_varlen_mosaic(
+        B_jax, x_jax, dt_chunked, dA_cumsum, cu_seqlens_jax, passed,
+    )
+    jax.block_until_ready(out_mosaic)
+    print(f"  out shape: {tuple(out_mosaic.shape)}")
+
+    # --- Naive reference ---
+    out_ref = _naive_chunk_state_varlen(
+        B_jax, x_jax, dt_chunked, dA_cumsum, cu_seqlens_jax, passed,
+    )
+
+    all_ok = check("varlen out vs naive", out_mosaic, out_ref, atol=atol)
+
+    # --- Optional Triton comparison ---
+    if _HAS_TRITON and _HAS_TRITON_VARLEN:
+        import torch as _torch
+        B_t = _torch.tensor(np.array(B_jax), device="cuda", dtype=_torch.float32)
+        x_t = _torch.tensor(np.array(x_jax), device="cuda", dtype=_torch.float32)
+        dt_t = _torch.tensor(np.array(dt_chunked), device="cuda", dtype=_torch.float32)
+        dA_t = _torch.tensor(np.array(dA_cumsum), device="cuda", dtype=_torch.float32)
+        cu_t = _torch.tensor(np.array(cu_seqlens_jax), device="cuda", dtype=_torch.int32)
+        cs_t = _torch.tensor(np.array(passed), device="cuda", dtype=_torch.float32)
+
+        out_tri = _triton_chunk_state_varlen(B_t, x_t, dt_t, dA_t, cu_t, cs_t)
+        out_tri_j = jnp.array(out_tri.cpu().numpy())
+        all_ok &= check("varlen out vs Triton", out_mosaic, out_tri_j, atol=atol)
+
+    print(f"  {'ALL PASS ✓' if all_ok else 'FAILURES DETECTED ✗'}")
+    return all_ok
+
+
+# ===========================================================================
+# chunk_state_varlen — benchmark
+# ===========================================================================
+
+def benchmark_chunk_state_varlen(
+    batch=100,
+    nheads=64,
+    headdim=64,
+    dstate=64,
+    ngroups=1,
+    chunk_size=64,
+    min_seqlen=10,
+    max_seqlen=200,
+    warmup=25,
+    rep=200,
+):
+    """Benchmark chunk_state_varlen_mosaic."""
+    print(f"\n── [chunk_state_varlen] benchmark  "
+          f"B={batch} H={nheads} N={headdim} D={dstate} G={ngroups} "
+          f"Q={chunk_size} seqlens=[{min_seqlen},{max_seqlen}] ──")
+
+    key = jax.random.PRNGKey(7)
+    keys = jax.random.split(key, 6)
+
+    seqlens = jax.random.randint(keys[0], (batch,), minval=min_seqlen, maxval=max_seqlen + 1)
+    seqlens = np.array(seqlens)
+    cu_seqlens = np.concatenate([[0], np.cumsum(seqlens)])
+    total_seqlen = int(cu_seqlens[-1])
+    nchunks = math.ceil(total_seqlen / chunk_size)
+    cu_seqlens_jax = jnp.array(cu_seqlens, dtype=jnp.int32)
+
+    B_j = jax.random.normal(keys[1], (total_seqlen, ngroups, dstate)) * 0.2
+    x_j = jax.random.normal(keys[2], (total_seqlen, nheads, headdim)) * 0.1
+    dt_j = jax.random.uniform(keys[3], (nheads, nchunks, chunk_size), minval=0.01, maxval=0.1)
+    dA_j = jnp.cumsum(
+        -jax.random.uniform(keys[4], (nheads, nchunks, chunk_size)) * 0.5, axis=-1
+    )
+    cs_j = jax.random.normal(keys[5], (nchunks, nheads, headdim, dstate)) * 0.01
+
+    fn_mosaic = jax.jit(lambda: chunk_state_varlen_mosaic(
+        B_j, x_j, dt_j, dA_j, cu_seqlens_jax, cs_j,
+    ))
+    jax.block_until_ready(fn_mosaic())
+
+    if _HAS_TRITON:
+        from triton.testing import do_bench
+        ms_mosaic = do_bench(lambda: jax.block_until_ready(fn_mosaic()), warmup=warmup, rep=rep)
+    else:
+        times = []
+        for _ in range(warmup + rep):
+            t0 = time.perf_counter()
+            jax.block_until_ready(fn_mosaic())
+            times.append(time.perf_counter() - t0)
+        ms_mosaic = float(np.median(times[warmup:])) * 1e3
+
+    print(f"  Mosaic GPU      : {ms_mosaic:.3f} ms")
+
+    if _HAS_TRITON and _HAS_TRITON_VARLEN:
+        import torch
+        from triton.testing import do_bench
+        B_t = _to_torch(B_j)
+        x_t = _to_torch(x_j)
+        dt_t = _to_torch(dt_j)
+        dA_t = _to_torch(dA_j)
+        cu_t = torch.tensor(np.array(cu_seqlens_jax), device="cuda", dtype=torch.int32)
+        cs_t = _to_torch(cs_j)
+
+        def _triton_fn():
+            _triton_chunk_state_varlen(B_t, x_t, dt_t, dA_t, cu_t, cs_t)
+            torch.cuda.synchronize()
+
+        ms_triton = do_bench(_triton_fn, warmup=warmup, rep=rep)
+        print(f"  Triton          : {ms_triton:.3f} ms")
+        print(f"  Mosaic / Triton : {ms_mosaic/ms_triton:.2f}x")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -553,5 +873,60 @@ if __name__ == "__main__":
 
     # Small chunk
     benchmark_chunk_scan(batch=2, seqlen=2048, nheads=64, hdim=64, dstate=64, ngroups=1, chunk_size=64)
+
+    # =================================================================
+    # chunk_state_varlen
+    # =================================================================
+    print("\n" + "=" * 70)
+    print("chunk_state_varlen_mosaic — Correctness Tests")
+    print("=" * 70)
+
+    # Basic configs
+    test_chunk_state_varlen_correctness(
+        batch=10, nheads=8, headdim=64, dstate=64, ngroups=1, chunk_size=64,
+    )
+    test_chunk_state_varlen_correctness(
+        batch=5, nheads=4, headdim=64, dstate=64, ngroups=1, chunk_size=128,
+    )
+    # Multi-group
+    test_chunk_state_varlen_correctness(
+        batch=10, nheads=8, headdim=64, dstate=64, ngroups=4, chunk_size=64,
+    )
+    test_chunk_state_varlen_correctness(
+        batch=10, nheads=16, headdim=64, dstate=64, ngroups=8, chunk_size=64,
+    )
+    # ngroups == nheads
+    test_chunk_state_varlen_correctness(
+        batch=5, nheads=8, headdim=64, dstate=64, ngroups=8, chunk_size=64,
+    )
+    # Larger dstate
+    test_chunk_state_varlen_correctness(
+        batch=5, nheads=8, headdim=64, dstate=128, ngroups=1, chunk_size=64,
+    )
+    # Larger headdim
+    test_chunk_state_varlen_correctness(
+        batch=5, nheads=4, headdim=128, dstate=64, ngroups=1, chunk_size=64,
+    )
+    # Very short sequences
+    test_chunk_state_varlen_correctness(
+        batch=20, nheads=4, headdim=64, dstate=64, ngroups=1, chunk_size=64,
+        min_seqlen=1, max_seqlen=10,
+    )
+    # Longer sequences spanning many chunks
+    test_chunk_state_varlen_correctness(
+        batch=5, nheads=8, headdim=64, dstate=64, ngroups=1, chunk_size=64,
+        min_seqlen=100, max_seqlen=500,
+    )
+
+    print("\n" + "=" * 70)
+    print("chunk_state_varlen_mosaic — Benchmarks")
+    print("=" * 70)
+
+    benchmark_chunk_state_varlen(
+        batch=100, nheads=64, headdim=64, dstate=64, ngroups=1, chunk_size=64,
+    )
+    benchmark_chunk_state_varlen(
+        batch=300, nheads=64, headdim=64, dstate=32, ngroups=1, chunk_size=64,
+    )
 
     print("\nDone.")
